@@ -112,7 +112,10 @@
 			</div>
 
 			<div class="flex min-w-0 items-center">
-				<Tooltip content={`${item.label} (${item.value})`} placement="top-start">
+				<Tooltip
+					content={$user?.role === 'admin' ? `${item.label} (${item.value})` : item.label}
+					placement="top-start"
+				>
 					<div class="line-clamp-1">
 						{item.label}
 					</div>

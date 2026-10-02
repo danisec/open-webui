@@ -401,6 +401,10 @@
 				);
 			}
 
+			if (tab.id === 'about') {
+				return $user?.role === 'admin';
+			}
+
 			return true;
 		});
 
@@ -502,6 +506,12 @@
 
 	$: if ($config && $user) {
 		availableSettings = getAvailableSettings(allSettings, adminSettings);
+	}
+
+	// Safety net: if the active tab is not available for this user (e.g. a hidden
+	// admin-only tab such as About, or a deep-link), fall back to 'general'.
+	$: if (availableSettings.length > 0 && !availableSettings.some((tab) => tab.id === selectedTab)) {
+		selectedTab = 'general';
 	}
 </script>
 
@@ -848,7 +858,7 @@
 						toast.success($i18n.t('Settings saved successfully!'));
 					}}
 				/>
-			{:else if selectedTab === 'about'}
+			{:else if selectedTab === 'about' && $user?.role === 'admin'}
 				<About />
 			{:else if selectedTab === 'admin:general'}
 				<AdminGeneral saveHandler={adminConfigSaveHandler} />
