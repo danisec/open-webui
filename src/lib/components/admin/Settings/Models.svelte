@@ -18,6 +18,7 @@
 	import {
 		createNewModel,
 		deleteAllModels,
+		deleteModelById,
 		getAllModels,
 		getModelById,
 		exportModels,
@@ -96,6 +97,8 @@
 
 	let showManageModal = false;
 	let showResetModal = false;
+	let showModelDeleteConfirm = false;
+	let deleteTargetModel: ModelListItem | null = null;
 	let savingModelOrder = false;
 	let savingModelsSettings = false;
 	let modelOrderDirty = false;
@@ -669,16 +672,28 @@
 		await updateUserSettings(localStorage.token, { ui: { pinnedModels: $settings.pinnedModels } });
 	};
 
+	const deleteModelHandler = async (model: ModelListItem) => {
+		const res = await deleteModelById(localStorage.token, model.id).catch((e) => {
+			toast.error(`${e}`);
+			return null;
+		});
+
+		if (res) {
+			toast.success($i18n.t(`Deleted {{name}}`, { name: model.id }));
+			await init();
+		}
+	};
+
 	onMount(async () => {
 		await init();
 
-		const onKeyDown = (event) => {
+		const onKeyDown = (event: KeyboardEvent) => {
 			if (event.key === 'Shift') {
 				shiftKey = true;
 			}
 		};
 
-		const onKeyUp = (event) => {
+		const onKeyUp = (event: KeyboardEvent) => {
 			if (event.key === 'Shift') {
 				shiftKey = false;
 			}
@@ -715,6 +730,18 @@
 		if (res) {
 			toast.success($i18n.t('All models deleted successfully'));
 			await init();
+		}
+	}}
+/>
+
+<ConfirmDialog
+	title={$i18n.t('Delete Model')}
+	message={$i18n.t('Are you sure you want to delete this model? This cannot be undone.')}
+	bind:show={showModelDeleteConfirm}
+	onConfirm={async () => {
+		if (deleteTargetModel) {
+			await deleteModelHandler(deleteTargetModel);
+			deleteTargetModel = null;
 		}
 	}}
 />
@@ -1214,6 +1241,10 @@
 										}}
 										cloneHandler={() => {
 											cloneHandler(model);
+										}}
+										deleteHandler={() => {
+											deleteTargetModel = model;
+											showModelDeleteConfirm = true;
 										}}
 										onClose={() => {}}
 									>

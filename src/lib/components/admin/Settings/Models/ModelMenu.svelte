@@ -36,6 +36,7 @@
 	export let pinModelHandler: Function;
 	export let copyLinkHandler: Function;
 	export let cloneHandler: Function;
+	export let deleteHandler: Function = null;
 
 	export let onClose: Function;
 
@@ -216,6 +217,19 @@
 
 				<div class="flex items-center">{$i18n.t('Export')}</div>
 			</button>
+
+			{#if deleteHandler}
+				<hr class="mx-1 my-0.5 border-gray-100 dark:border-gray-800" />
+
+				<button
+					class="select-none flex w-full gap-2 items-center h-[1.6875rem] px-2 text-[0.8125rem] font-normal cursor-pointer text-red-600 hover:bg-red-50/60 dark:text-red-400 dark:hover:bg-red-900/20 rounded-xl"
+					on:click={() => runAndClose(deleteHandler)}
+				>
+					<GarbageBin />
+
+					<div class="flex items-center">{$i18n.t('Delete')}</div>
+				</button>
+			{/if}
 		</DropdownMenu>
 	</div>
 </Dropdown>
