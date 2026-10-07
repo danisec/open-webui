@@ -6341,9 +6341,67 @@ async def streaming_chat_response_handler(response, ctx):
                     and tool_calls
                     and tool_call_iterations >= max_tool_call_iterations
                 ):
-                    log.warning('Tool-call iteration limit reached (%s)', max_tool_call_iterations)
-                    error_content = f'Tool-call limit reached ({max_tool_call_iterations} iterations).'
-                    await emit_message_error(error_content)
+                    log.warning(
+                        'Tool-call iteration limit reached (%s); forcing final answer',
+                        max_tool_call_iterations,
+                    )
+                    # Force one final completion WITHOUT tools so the model must
+                    # answer from the results it already gathered, instead of
+                    # surfacing a bare limit error.
+                    try:
+                        final_form_data = {
+                            **form_data,
+                            'model': model_id,
+                            'stream': True,
+                            'metadata': metadata,
+                        }
+                        final_form_data.pop('tools', None)
+                        final_form_data.pop('tool_ids', None)
+                        final_form_data['messages'] = [
+                            *form_data['messages'],
+                            *convert_output_to_messages(output, raw=True, reasoning_format=get_reasoning_format(model)),
+                            {
+                                'role': 'user',
+                                'content': (
+                                    'Batas pemanggilan tool tercapai. Susun jawaban final '
+                                    'dari informasi yang sudah dikumpulkan. Jangan memanggil tool lagi.'
+                                ),
+                            },
+                        ]
+                        res = await generate_chat_completion(
+                            request,
+                            final_form_data,
+                            user,
+                            bypass_system_prompt=True,
+                        )
+                        if isinstance(res, StreamingResponse):
+                            prior_output = list(full_output())
+                            output = []
+                            output_start = len(prior_output)
+                            await stream_body_handler(res, final_form_data)
+                            output = full_output()
+                        elif getattr(res, 'status_code', 200) >= 400:
+                            await emit_message_error(get_message_error_content(get_response_error_detail(res)))
+                        else:
+                            forced_content = ''
+                            try:
+                                forced_content = res['choices'][0]['message'].get('content') or ''
+                            except Exception:
+                                forced_content = ''
+                            if forced_content:
+                                output.append(
+                                    {
+                                        'type': 'message',
+                                        'id': output_id('msg'),
+                                        'status': 'completed',
+                                        'role': 'assistant',
+                                        'content': [{'type': 'output_text', 'text': forced_content}],
+                                    }
+                                )
+                    except Exception as e:
+                        log.exception('Forced final answer failed: %s', e)
+                        error_content = f'Tool-call limit reached ({max_tool_call_iterations} iterations).'
+                        await emit_message_error(error_content)
 
                 if DETECT_CODE_INTERPRETER:
                     MAX_RETRIES = 5

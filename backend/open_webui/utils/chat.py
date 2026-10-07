@@ -27,6 +27,7 @@ from open_webui.socket.main import (
     get_event_call,
     get_event_emitter,
 )
+from open_webui.utils.dsml import parse_dsml
 from open_webui.utils.filter import (
     get_filter_functions,
     process_filter_functions,
@@ -42,6 +43,130 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 
 logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
+
+
+_DSML_MARKERS = ('<||DSML', '||DSML', '\uff5c\uff5cDSML')
+
+
+def _hold_tail(buffer: str) -> int:
+    """Length of the trailing substring that may be a partial DSML marker."""
+    hold = 0
+    for marker in _DSML_MARKERS:
+        for size in range(1, len(marker)):
+            if buffer.endswith(marker[:size]):
+                hold = max(hold, size)
+    return hold
+
+
+def _content_delta(text: str) -> bytes:
+    payload = {'choices': [{'index': 0, 'delta': {'content': text}}]}
+    return f'data: {JSONCodec.dumps(payload)}\n\n'.encode()
+
+
+def _tool_call_delta(call: dict) -> bytes:
+    payload = {
+        'choices': [
+            {
+                'index': 0,
+                'delta': {
+                    'tool_calls': [
+                        {
+                            'index': 0,
+                            'id': call.get('id'),
+                            'type': 'function',
+                            'function': call.get('function', {}),
+                        }
+                    ]
+                },
+                'finish_reason': 'tool_calls',
+            }
+        ]
+    }
+    return f'data: {JSONCodec.dumps(payload)}\n\n'.encode()
+
+
+def _drain(buffer: str, final: bool) -> tuple[list[bytes], str]:
+    """Convert complete DSML blocks in ``buffer`` to SSE events.
+
+    Returns ``(events, remaining_buffer)``. Incomplete DSML is held back until
+    more bytes arrive (or ``final`` forces a flush).
+    """
+    events: list[bytes] = []
+
+    clean, calls = parse_dsml(buffer)
+    if calls:
+        if clean:
+            events.append(_content_delta(clean))
+        for call in calls:
+            events.append(_tool_call_delta(call))
+        return events, ''
+
+    start = None
+    for marker in _DSML_MARKERS:
+        idx = buffer.find(marker)
+        if idx != -1 and (start is None or idx < start):
+            start = idx
+
+    if start is not None:
+        if buffer[:start]:
+            events.append(_content_delta(buffer[:start]))
+        held = buffer[start:]
+        if final and held:
+            events.append(_content_delta(held))
+            return events, ''
+        return events, held
+
+    if final:
+        if buffer:
+            events.append(_content_delta(buffer))
+        return events, ''
+
+    hold = _hold_tail(buffer)
+    safe = buffer[: len(buffer) - hold] if hold else buffer
+    if safe:
+        events.append(_content_delta(safe))
+    return events, (buffer[len(buffer) - hold :] if hold else '')
+
+
+async def _normalize_dsml_stream(stream):
+    """Rewrite DeepSeek DSML text tool calls in an SSE stream to tool_calls.
+
+    Assistant content is buffered just enough to detect DSML blocks; complete
+    blocks become OpenAI ``tool_calls`` deltas so Open WebUI's native tool loop
+    executes them. Non-DSML content streams through unchanged.
+    """
+    buffer = ''
+    async for raw in stream:
+        text = raw.decode('utf-8', 'ignore') if isinstance(raw, (bytes, bytearray)) else raw
+        if not text.startswith('data:'):
+            yield raw if isinstance(raw, (bytes, bytearray)) else text.encode()
+            continue
+
+        payload = text[5:].strip()
+        if payload in ('', '[DONE]'):
+            events, buffer = _drain(buffer, final=True)
+            for event in events:
+                yield event
+            yield text.encode()
+            continue
+
+        try:
+            data = JSONCodec.loads(payload)
+        except Exception:
+            yield text.encode()
+            continue
+
+        choices = data.get('choices') or []
+        delta = choices[0].get('delta') if choices else None
+        content = delta.get('content') if isinstance(delta, dict) else None
+        if not content:
+            yield text.encode()
+            continue
+
+        buffer += content
+        events, buffer = _drain(buffer, final=False)
+        for event in events:
+            yield event
 
 
 # When the question has been asked, let silence not be the
@@ -298,11 +423,20 @@ async def generate_chat_completion(
             else:
                 return convert_response_ollama_to_openai(response)
         else:
-            return await generate_openai_chat_completion(
+            response = await generate_openai_chat_completion(
                 request=request,
                 form_data=form_data,
                 user=user,
             )
+            if isinstance(response, StreamingResponse):
+                return StreamingResponse(
+                    _normalize_dsml_stream(response.body_iterator),
+                    status_code=response.status_code,
+                    headers=dict(response.headers),
+                    media_type=response.media_type,
+                    background=response.background,
+                )
+            return response
 
 
 chat_completion = generate_chat_completion
