@@ -915,7 +915,7 @@
 		);
 	};
 
-	const uploadFileHandler = async (file, process = true, itemData = {}) => {
+	const uploadFileHandler = async (file, process = false, itemData = {}) => {
 		if ($_user?.role !== 'admin' && !($_user?.permissions?.chat?.file_upload ?? true)) {
 			toast.error($i18n.t('You do not have permission to upload files.'));
 			return null;
