@@ -144,7 +144,7 @@ RUN apt-get update && \
     curl jq ca-certificates \
     && if [ "$USE_SLIM" != "true" ]; then \
     apt-get install -y --no-install-recommends \
-    git build-essential pandoc gcc libmariadb-dev ffmpeg libsm6 libxext6; \
+    git build-essential pandoc gcc libmariadb-dev ffmpeg libsm6 libxext6 jbig2dec; \
     fi && if [ "$USE_OLLAMA" = "true" ]; then \
     apt-get install -y --no-install-recommends zstd; \
     fi && rm -rf /var/lib/apt/lists/*
