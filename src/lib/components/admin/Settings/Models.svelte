@@ -25,7 +25,8 @@
 		toggleModelById,
 		updateModelById,
 		updateModelAccessGrants,
-		importModels
+		importModels,
+		testModelConnection
 	} from '$lib/apis/models';
 	import { copyToClipboard } from '$lib/utils';
 	import { updateUserSettings } from '$lib/apis/users';
@@ -662,6 +663,24 @@
 		saveAs(blob, `${model.id}-${Date.now()}.json`);
 	};
 
+	const testModelHandler = async (model: ModelListItem) => {
+		const target = await getFullModel(model);
+		const id = target?.id ?? model?.id;
+		const toastId = `model-test-${id}`;
+		toast.loading(`${$i18n.t('Testing connection')}: ${id}...`, { id: toastId });
+		try {
+			const res = await testModelConnection(localStorage.token, id);
+			if (res?.ok) {
+				toast.success(`${id} — ${$i18n.t('Connected')} (${res.latency_ms}ms)`, { id: toastId });
+			} else {
+				toast.error(`${id} — ${res?.error ?? $i18n.t('Connection failed')}`, { id: toastId });
+			}
+		} catch (error) {
+			const detail = (error as { detail?: string })?.detail ?? error;
+			toast.error(`${id} — ${String(detail)}`, { id: toastId });
+		}
+	};
+
 	const pinModelHandler = async (modelId) => {
 		settings.set({
 			...$settings,
@@ -1241,6 +1260,9 @@
 										}}
 										cloneHandler={() => {
 											cloneHandler(model);
+										}}
+										testHandler={() => {
+											testModelHandler(model);
 										}}
 										deleteHandler={() => {
 											deleteTargetModel = model;

@@ -11,6 +11,20 @@ export const exportModels = async (token: string, ids?: string[]) => {
 	return response.json();
 };
 
+export const testModelConnection = async (token: string, id: string) => {
+	const res = await fetch(`${WEBUI_API_BASE_URL}/models/model/test`, {
+		method: 'POST',
+		headers: {
+			Accept: 'application/json',
+			'Content-Type': 'application/json',
+			authorization: `Bearer ${token}`
+		},
+		body: JSON.stringify({ id })
+	});
+	if (!res.ok) throw await res.json();
+	return res.json();
+};
+
 export const getModelItems = async (
 	token: string = '',
 	query,

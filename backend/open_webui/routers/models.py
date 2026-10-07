@@ -1150,6 +1150,47 @@ async def delete_model_by_id(
     return result
 
 
+@router.post('/model/test')
+async def test_model_connection(
+    request: Request,
+    form_data: ModelIdForm,
+    user=Depends(get_admin_user),
+):
+    """Send a minimal completion to a model to check it is reachable."""
+    import time
+
+    from open_webui.utils.chat import generate_chat_completion
+
+    started = time.time()
+    payload = {
+        'model': form_data.id,
+        'messages': [{'role': 'user', 'content': 'ping'}],
+        'stream': False,
+        'max_tokens': 8,
+    }
+    try:
+        res = await generate_chat_completion(request, payload, user)
+        latency = int((time.time() - started) * 1000)
+
+        if isinstance(res, StreamingResponse):
+            return {'ok': True, 'latency_ms': latency, 'response': '(streaming)'}
+        if getattr(res, 'status_code', 200) >= 400:
+            return {'ok': False, 'latency_ms': latency, 'error': f'HTTP {res.status_code}'}
+
+        content = ''
+        try:
+            content = (res['choices'][0]['message'].get('content') or '').strip()
+        except Exception:
+            pass
+        return {'ok': True, 'latency_ms': latency, 'response': content[:200]}
+    except Exception as e:
+        return {
+            'ok': False,
+            'latency_ms': int((time.time() - started) * 1000),
+            'error': str(e)[:300],
+        }
+
+
 @router.delete('/delete/all', response_model=bool)
 async def delete_all_models(
     request: Request, user=Depends(get_admin_user), db: AsyncSession = Depends(get_async_session)
