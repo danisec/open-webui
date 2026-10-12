@@ -402,6 +402,10 @@
 				);
 			}
 
+			if (tab.id === 'about') {
+				return $user?.role === 'admin';
+			}
+
 			return true;
 		});
 
@@ -849,7 +853,7 @@
 						toast.success($i18n.t('Settings saved successfully!'));
 					}}
 				/>
-			{:else if selectedTab === 'about'}
+			{:else if selectedTab === 'about' && $user?.role === 'admin'}
 				<About />
 			{:else if selectedTab === 'admin:general'}
 				<AdminGeneral saveHandler={adminConfigSaveHandler} />
