@@ -43,6 +43,7 @@
 	import ChevronRight from '$lib/components/icons/ChevronRight.svelte';
 	import ChevronLeft from '$lib/components/icons/ChevronLeft.svelte';
 	import LinkSlash from '$lib/components/icons/LinkSlash.svelte';
+	import Link from '$lib/components/icons/Link.svelte';
 
 	const i18n = getContext('i18n') as any;
 
@@ -643,9 +644,18 @@
 											</div>
 										{/if}
 
-										<div class=" shrink-0" inert>
-											<Switch state={selectedToolIds.includes(toolId)} />
-										</div>
+										{#if !(tools?.[toolId]?.authenticated ?? true)}
+											<div
+												class="relative z-20 shrink-0 flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[0.6875rem] font-medium text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-400/10 border border-amber-200/40 dark:border-amber-500/20"
+											>
+												<Link className="size-3" strokeWidth="1.75" />
+												<span>{$i18n.t('Connect')}</span>
+											</div>
+										{:else}
+											<div class=" shrink-0" inert>
+												<Switch state={selectedToolIds.includes(toolId)} />
+											</div>
+										{/if}
 									</button>
 								{/each}
 							</div>

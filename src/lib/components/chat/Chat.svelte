@@ -948,25 +948,6 @@
 		console.log('saveSessionSelectedModels', selectedModels, sessionStorage.selectedModels);
 	};
 
-	const continueOAuthRedirect = async () => {
-		if (pendingOAuthTools.length === 0) {
-			sessionStorage.removeItem('oauthRedirectInProgressToolId');
-			return;
-		}
-
-		if (chatIdProp) {
-			return;
-		}
-
-		const nextTool = pendingOAuthTools[0];
-		if (sessionStorage.getItem('oauthRedirectInProgressToolId') === nextTool.id) {
-			sessionStorage.removeItem('oauthRedirectInProgressToolId');
-			return;
-		}
-
-		await oauthRedirectHandler(nextTool);
-	};
-
 	const resetInput = async () => {
 		selectedToolIds = [];
 		selectedSkillIds = [];
@@ -1051,8 +1032,8 @@
 						}
 					}
 					selectedToolIds = authed;
+					// OAuth tools stay as opt-in "Click to connect" badges; never auto-redirect on chat load.
 					pendingOAuthTools = unauthed;
-					await continueOAuthRedirect();
 				} else if ($settings?.tools) {
 					selectedToolIds = $settings.tools;
 				} else {
