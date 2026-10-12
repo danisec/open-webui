@@ -100,6 +100,10 @@ from starlette.responses import RedirectResponse
 JWSRegistry.__init__ = partialmethod(JWSRegistry.__init__, strict_check_header=False)
 
 
+class _TransientOAuthError(Exception):
+    """OAuth refresh failed transiently (network/5xx) and is worth retrying before giving up."""
+
+
 class OAuthClientMetadata(MCPOAuthClientMetadata):
     token_endpoint_auth_method: Literal['none', 'client_secret_basic', 'client_secret_post'] = 'client_secret_post'
     pass
@@ -1098,15 +1102,44 @@ class OAuthClientManager:
                 or datetime.now() + timedelta(minutes=5) >= datetime.fromtimestamp(session.expires_at)
             ):
                 log.debug('Token refresh needed for user %s, client_id %s', user_id, session.provider)
-                refreshed_token = await self._refresh_token(session)
+                refreshed_token = None
+                delete_session = False
+                for attempt in range(3):
+                    try:
+                        refreshed_token = await self._refresh_token(session)
+                        if refreshed_token:
+                            break
+                        # _refresh_token returned None => permanent failure (e.g. invalid_grant)
+                        delete_session = True
+                        break
+                    except _TransientOAuthError as e:
+                        log.warning(
+                            'Transient token refresh error for user %s (attempt %d/3): %s',
+                            user_id,
+                            attempt + 1,
+                            e,
+                        )
+                        if attempt < 2:
+                            await asyncio.sleep(0.5 * (attempt + 1))
+                            continue
+                        # Retries exhausted on a transient error: keep the session so a later
+                        # request can retry instead of forcing the user to re-authenticate.
+                        delete_session = False
+                        break
                 if refreshed_token:
                     return refreshed_token
-                else:
+                if delete_session:
                     log.warning(
-                        f'Token refresh failed for user {user_id}, client_id {session.provider}, deleting session {session.id}'
+                        f'Token refresh permanently failed for user {user_id}, client_id {session.provider}, '
+                        f'deleting session {session.id}'
                     )
                     await OAuthSessions.delete_session_by_id(session.id)
-                    return None
+                else:
+                    log.warning(
+                        f'Token refresh transiently failed (session kept) '
+                        f'for user {user_id}, client_id {session.provider}'
+                    )
+                return None
             return session.token
 
         except Exception as e:
@@ -1136,6 +1169,8 @@ class OAuthClientManager:
                 log.error(f'Failed to refresh token for session {session.id}')
                 return None
 
+        except _TransientOAuthError:
+            raise
         except Exception as e:
             log.error(f'Error refreshing token for session {session.id}: {e}')
             return None
@@ -1212,9 +1247,17 @@ class OAuthClientManager:
                         return new_token_data
                     else:
                         error_text = await r.text()
+                        if r.status >= 500:
+                            raise _TransientOAuthError(
+                                f'Token refresh transient {r.status} for client_id {client_id}: {error_text[:200]}'
+                            )
                         log.error(f'Token refresh failed for client_id {client_id}: {r.status} - {error_text}')
                         return None
 
+        except _TransientOAuthError:
+            raise
+        except (aiohttp.ClientError, TimeoutError) as e:
+            raise _TransientOAuthError(f'Token refresh network error for client_id {client_id}: {e}') from e
         except Exception as e:
             log.error(f'Exception during token refresh for client_id {client_id}: {e}')
             return None
@@ -1433,16 +1476,45 @@ class OAuthManager:
                 or datetime.now() + timedelta(minutes=5) >= datetime.fromtimestamp(expires_at)
             ):
                 log.debug('Token refresh needed for user %s, provider %s', user_id, session.provider)
-                refreshed_token = await self._refresh_token(session)
+                refreshed_token = None
+                delete_session = False
+                for attempt in range(3):
+                    try:
+                        refreshed_token = await self._refresh_token(session)
+                        if refreshed_token:
+                            break
+                        # _refresh_token returned None => permanent failure (e.g. invalid_grant)
+                        delete_session = True
+                        break
+                    except _TransientOAuthError as e:
+                        log.warning(
+                            'Transient token refresh error for user %s (attempt %d/3): %s',
+                            user_id,
+                            attempt + 1,
+                            e,
+                        )
+                        if attempt < 2:
+                            await asyncio.sleep(0.5 * (attempt + 1))
+                            continue
+                        # Retries exhausted on a transient error: keep the session so a later
+                        # request can retry instead of forcing the user to re-authenticate.
+                        delete_session = False
+                        break
                 if refreshed_token:
                     return refreshed_token
-                else:
+                if delete_session:
                     log.warning(
-                        f'Token refresh failed for user {user_id}, provider {session.provider}, deleting session {session.id}'
+                        f'Token refresh permanently failed for user {user_id}, provider {session.provider}, '
+                        f'deleting session {session.id}'
                     )
                     await OAuthSessions.delete_session_by_id(session.id)
+                else:
+                    log.warning(
+                        f'Token refresh transiently failed (session kept) '
+                        f'for user {user_id}, provider {session.provider}'
+                    )
 
-                    return None
+                return None
             return session.token
 
         except Exception as e:
@@ -1485,6 +1557,8 @@ class OAuthManager:
                     log.error(f'Failed to refresh token for session {session.id}')
                     return None
 
+            except _TransientOAuthError:
+                raise
             except Exception as e:
                 log.error(f'Error refreshing token for session {session.id}: {e}')
                 return None
@@ -1565,9 +1639,17 @@ class OAuthManager:
                         return new_token_data
                     else:
                         error_text = await r.text()
+                        if r.status >= 500:
+                            raise _TransientOAuthError(
+                                f'Token refresh transient {r.status} for provider {provider}: {error_text[:200]}'
+                            )
                         log.error(f'Token refresh failed for provider {provider}: {r.status} - {error_text}')
                         return None
 
+        except _TransientOAuthError:
+            raise
+        except (aiohttp.ClientError, TimeoutError) as e:
+            raise _TransientOAuthError(f'Token refresh network error for provider {provider}: {e}') from e
         except Exception as e:
             log.error(f'Exception during token refresh for provider {provider}: {e}')
             return None
