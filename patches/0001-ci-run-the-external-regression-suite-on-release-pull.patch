@@ -1,0 +1,114 @@
+From 0a7c15832fb30b1903753e83f81dc7d27e5b0944 Mon Sep 17 00:00:00 2001
+From: Classic298 <27028174+Classic298@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 01:43:32 +0200
+Subject: [PATCH 01/12] ci: run the external regression suite on release pull
+ requests (#29313)
+
+* ci: run the external regression suite on release pull requests
+
+Adds a workflow that runs the open-webui/tests unit suite against release
+candidates, so a release that reintroduces a fixed bug is caught before it is cut
+rather than after users report it. The suite is roughly 4500 source-level tests
+pinned to specific past issues and PRs, and takes about three minutes; the
+dependency install dominates the run and is cached.
+
+It runs only on pull requests into main whose title starts with a version, which
+is how releases are titled here, or which touch package.json. Everything else
+into main, and every pull request into dev, skips it and reports green.
+
+Two settings are needed for this to block anything, both outside the diff:
+require the Regression / Result check on main, and require branches to be up to
+date before merging so the suite covers what actually lands.
+
+The reusable workflow is referenced at @main so a release always runs the current
+tests. Pinning it to a tag instead is a reasonable call to make here.
+
+* ci: cancel superseded regression runs
+
+A queued run on a release PR meant a stale commit's suite kept blocking
+the required check after newer commits shipped, wasting a runner slot
+and the author's time waiting on a result nobody needed. Cancel it
+instead so the suite always runs against the latest push.
+
+* ci: rename the Regression workflow to Tests
+
+* Update regression.yaml
+
+* ci: gate the test suite with a job condition instead of a gate job
+
+Replaces the gate job with a condition on the suite job itself. The job existed
+to look for a version title or a change to package.json, and the package.json
+check is redundant: a release bumps the version in that file and carries it in
+the title, so the title alone identifies one. That removes a runner, an API call
+and the pull-requests read permission.
+
+The suite now runs on version-titled pull requests from dev into main, and on
+version-titled pull requests into dev so it can be exercised outside a release.
+An edit only re-runs it when the title itself changed, and an edit no longer
+cancels a suite that is already running, which would otherwise leave the check
+green with nothing behind it.
+
+* ci: match only the version prefixes releases actually use
+
+Release pull requests are titled 0.11.3, not v0.11.3, so the leading v never
+matched. The remaining digits are dropped with it and the dot is kept, so a
+title that merely starts with a digit does not run the suite.
+---
+ .github/workflows/regression.yaml | 45 +++++++++++++++++++++++++++++++
+ 1 file changed, 45 insertions(+)
+ create mode 100644 .github/workflows/regression.yaml
+
+diff --git a/.github/workflows/regression.yaml b/.github/workflows/regression.yaml
+new file mode 100644
+index 000000000..986278ffd
+--- /dev/null
++++ b/.github/workflows/regression.yaml
+@@ -0,0 +1,45 @@
++# ─────────────────────────────────────────────────────────────────────────────
++# Tests — run the open-webui/tests unit suite against a release candidate
++# Release pull requests go from dev into main and are titled with the version
++# ─────────────────────────────────────────────────────────────────────────────
++name: Tests
++
++on:
++  pull_request:
++    branches: [main, dev]
++    types: [opened, synchronize, reopened, edited]
++
++# An edit must not cancel a running suite: the replacement run would skip it and still report green.
++concurrency:
++  group: regression-${{ github.ref }}
++  cancel-in-progress: ${{ github.event.action != 'edited' }}
++
++jobs:
++  # Into main only the release branch counts; into dev any version title does, so the
++  # suite can be exercised outside a release. Expressions have no regex, hence the literal prefixes.
++  regression:
++    name: Suite
++    if: >-
++      (github.event.pull_request.base.ref == 'dev' ||
++      github.event.pull_request.head.ref == 'dev') &&
++      (github.event.action != 'edited' || github.event.changes.title != null) &&
++      (startsWith(github.event.pull_request.title, '0.') ||
++      startsWith(github.event.pull_request.title, '1.'))
++    permissions:
++      contents: read
++    uses: open-webui/tests/.github/workflows/regression.yml@main
++    with:
++      open-webui-ref: ${{ github.event.pull_request.head.sha }}
++
++  # Single check to require in branch protection.
++  result:
++    name: Result
++    needs: [regression]
++    if: always()
++    runs-on: ubuntu-latest
++    timeout-minutes: 5
++    permissions: {}
++    steps:
++      - name: Fail unless the suite passed or was not required
++        if: needs.regression.result != 'success' && needs.regression.result != 'skipped'
++        run: exit 1
+-- 
+2.43.0
+

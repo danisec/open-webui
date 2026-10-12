@@ -1,0 +1,180 @@
+From 5e9065ac480f60ddcc40470d18b89f68dfa97ca8 Mon Sep 17 00:00:00 2001
+From: Dani Aprilyanto <daniaprilyanto35@gmail.com>
+Date: Wed, 7 Oct 2026 15:49:35 +0000
+Subject: [PATCH 05/12] feat: add model connection test from admin settings
+
+Add a POST /model/test endpoint and a Test Connection action in the model menu that pings a model and reports its latency.
+---
+ backend/open_webui/routers/models.py          | 41 +++++++++++++++++++
+ src/lib/apis/models/index.ts                  | 14 +++++++
+ .../components/admin/Settings/Models.svelte   | 24 ++++++++++-
+ .../admin/Settings/Models/ModelMenu.svelte    | 13 ++++++
+ 4 files changed, 91 insertions(+), 1 deletion(-)
+
+diff --git a/backend/open_webui/routers/models.py b/backend/open_webui/routers/models.py
+index e8426b1da..aee03ee6a 100644
+--- a/backend/open_webui/routers/models.py
++++ b/backend/open_webui/routers/models.py
+@@ -1150,6 +1150,47 @@ async def delete_model_by_id(
+     return result
+ 
+ 
++@router.post('/model/test')
++async def test_model_connection(
++    request: Request,
++    form_data: ModelIdForm,
++    user=Depends(get_admin_user),
++):
++    """Send a minimal completion to a model to check it is reachable."""
++    import time
++
++    from open_webui.utils.chat import generate_chat_completion
++
++    started = time.time()
++    payload = {
++        'model': form_data.id,
++        'messages': [{'role': 'user', 'content': 'ping'}],
++        'stream': False,
++        'max_tokens': 8,
++    }
++    try:
++        res = await generate_chat_completion(request, payload, user)
++        latency = int((time.time() - started) * 1000)
++
++        if isinstance(res, StreamingResponse):
++            return {'ok': True, 'latency_ms': latency, 'response': '(streaming)'}
++        if getattr(res, 'status_code', 200) >= 400:
++            return {'ok': False, 'latency_ms': latency, 'error': f'HTTP {res.status_code}'}
++
++        content = ''
++        try:
++            content = (res['choices'][0]['message'].get('content') or '').strip()
++        except Exception:
++            pass
++        return {'ok': True, 'latency_ms': latency, 'response': content[:200]}
++    except Exception as e:
++        return {
++            'ok': False,
++            'latency_ms': int((time.time() - started) * 1000),
++            'error': str(e)[:300],
++        }
++
++
+ @router.delete('/delete/all', response_model=bool)
+ async def delete_all_models(
+     request: Request, user=Depends(get_admin_user), db: AsyncSession = Depends(get_async_session)
+diff --git a/src/lib/apis/models/index.ts b/src/lib/apis/models/index.ts
+index 11b3829cc..5b5824cb2 100644
+--- a/src/lib/apis/models/index.ts
++++ b/src/lib/apis/models/index.ts
+@@ -11,6 +11,20 @@ export const exportModels = async (token: string, ids?: string[]) => {
+ 	return response.json();
+ };
+ 
++export const testModelConnection = async (token: string, id: string) => {
++	const res = await fetch(`${WEBUI_API_BASE_URL}/models/model/test`, {
++		method: 'POST',
++		headers: {
++			Accept: 'application/json',
++			'Content-Type': 'application/json',
++			authorization: `Bearer ${token}`
++		},
++		body: JSON.stringify({ id })
++	});
++	if (!res.ok) throw await res.json();
++	return res.json();
++};
++
+ export const getModelItems = async (
+ 	token: string = '',
+ 	query,
+diff --git a/src/lib/components/admin/Settings/Models.svelte b/src/lib/components/admin/Settings/Models.svelte
+index 6393afe57..93215519a 100644
+--- a/src/lib/components/admin/Settings/Models.svelte
++++ b/src/lib/components/admin/Settings/Models.svelte
+@@ -25,7 +25,8 @@
+ 		toggleModelById,
+ 		updateModelById,
+ 		updateModelAccessGrants,
+-		importModels
++		importModels,
++		testModelConnection
+ 	} from '$lib/apis/models';
+ 	import { copyToClipboard } from '$lib/utils';
+ 	import { updateUserSettings } from '$lib/apis/users';
+@@ -662,6 +663,24 @@
+ 		saveAs(blob, `${model.id}-${Date.now()}.json`);
+ 	};
+ 
++	const testModelHandler = async (model: ModelListItem) => {
++		const target = await getFullModel(model);
++		const id = target?.id ?? model?.id;
++		const toastId = `model-test-${id}`;
++		toast.loading(`${$i18n.t('Testing connection')}: ${id}...`, { id: toastId });
++		try {
++			const res = await testModelConnection(localStorage.token, id);
++			if (res?.ok) {
++				toast.success(`${id} — ${$i18n.t('Connected')} (${res.latency_ms}ms)`, { id: toastId });
++			} else {
++				toast.error(`${id} — ${res?.error ?? $i18n.t('Connection failed')}`, { id: toastId });
++			}
++		} catch (error) {
++			const detail = (error as { detail?: string })?.detail ?? error;
++			toast.error(`${id} — ${String(detail)}`, { id: toastId });
++		}
++	};
++
+ 	const pinModelHandler = async (modelId) => {
+ 		settings.set({
+ 			...$settings,
+@@ -1242,6 +1261,9 @@
+ 										cloneHandler={() => {
+ 											cloneHandler(model);
+ 										}}
++										testHandler={() => {
++											testModelHandler(model);
++										}}
+ 										deleteHandler={() => {
+ 											deleteTargetModel = model;
+ 											showModelDeleteConfirm = true;
+diff --git a/src/lib/components/admin/Settings/Models/ModelMenu.svelte b/src/lib/components/admin/Settings/Models/ModelMenu.svelte
+index e456a8782..4beabeb7c 100644
+--- a/src/lib/components/admin/Settings/Models/ModelMenu.svelte
++++ b/src/lib/components/admin/Settings/Models/ModelMenu.svelte
+@@ -17,6 +17,7 @@
+ 	import Check from '$lib/components/icons/Check.svelte';
+ 	import GlobeAlt from '$lib/components/icons/GlobeAlt.svelte';
+ 	import LockClosed from '$lib/components/icons/LockClosed.svelte';
++	import Bolt from '$lib/components/icons/Bolt.svelte';
+ 
+ 	import { config, pinnedModels, settings } from '$lib/stores';
+ 	import Link from '$lib/components/icons/Link.svelte';
+@@ -36,6 +37,7 @@
+ 	export let pinModelHandler: Function;
+ 	export let copyLinkHandler: Function;
+ 	export let cloneHandler: Function;
++	export let testHandler: (() => void) | null = null;
+ 	export let deleteHandler: Function = null;
+ 
+ 	export let onClose: Function;
+@@ -218,6 +220,17 @@
+ 				<div class="flex items-center">{$i18n.t('Export')}</div>
+ 			</button>
+ 
++			{#if testHandler && (model?.is_active ?? true) && model?.owned_by !== 'arena'}
++				<button
++					class="select-none flex w-full gap-2 items-center h-[1.6875rem] px-2 text-[0.8125rem] font-normal cursor-pointer hover:bg-gray-50/40 dark:hover:bg-gray-800/40 rounded-xl"
++					on:click={() => runAndClose(testHandler)}
++				>
++					<Bolt className="size-3.5" />
++
++					<div class="flex items-center">{$i18n.t('Test Connection')}</div>
++				</button>
++			{/if}
++
+ 			{#if deleteHandler}
+ 				<hr class="mx-1 my-0.5 border-gray-100 dark:border-gray-800" />
+ 
+-- 
+2.43.0
+

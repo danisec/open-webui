@@ -1,0 +1,84 @@
+From c9eb837155f8b6b2f0ffa88c7175a87798bacbe7 Mon Sep 17 00:00:00 2001
+From: Dani Aprilyanto <daniaprilyanto35@gmail.com>
+Date: Mon, 12 Oct 2026 03:38:52 +0000
+Subject: [PATCH 12/12] fix: improve dark-mode button and high-contrast text
+ colors
+
+Use dark:text-black on dark-mode buttons and scope the high-contrast override to exclude dark backgrounds.
+---
+ src/app.css                                             | 3 ++-
+ src/lib/components/channel/Messages/Message.svelte      | 2 +-
+ src/lib/components/chat/Messages/ResponseMessage.svelte | 2 +-
+ src/lib/components/chat/Messages/UserMessage.svelte     | 2 +-
+ src/lib/components/common/ConfirmDialog.svelte          | 2 +-
+ 5 files changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/src/app.css b/src/app.css
+index fee41b409..0da5a2f1a 100644
+--- a/src/app.css
++++ b/src/app.css
+@@ -969,7 +969,8 @@ html.high-contrast.dark
+ 		color: var(--color-gray-700);
+ 	}
+ 
+-	html:where(.high-contrast).dark :is(.dark\:text-gray-700, .dark\:text-gray-800) {
++	html:where(.high-contrast).dark
++		:is(.dark\:text-gray-700, .dark\:text-gray-800):not(.dark\:bg-white):not(.dark\:bg-gray-100) {
+ 		color: var(--color-gray-300);
+ 	}
+ 
+diff --git a/src/lib/components/channel/Messages/Message.svelte b/src/lib/components/channel/Messages/Message.svelte
+index bd5d35475..1100c8187 100644
+--- a/src/lib/components/channel/Messages/Message.svelte
++++ b/src/lib/components/channel/Messages/Message.svelte
+@@ -518,7 +518,7 @@
+ 
+ 									<button
+ 										id="confirm-edit-message-button"
+-										class="px-3.5 py-1.5 bg-gray-900 dark:bg-white hover:bg-gray-850 text-gray-100 dark:text-gray-800 transition rounded-3xl"
++										class="px-3.5 py-1.5 bg-gray-900 dark:bg-white hover:bg-gray-850 text-gray-100 dark:text-black transition rounded-3xl"
+ 										on:click={async () => {
+ 											onEdit(editedContent);
+ 											edit = false;
+diff --git a/src/lib/components/chat/Messages/ResponseMessage.svelte b/src/lib/components/chat/Messages/ResponseMessage.svelte
+index 48af8d030..4b0eed609 100644
+--- a/src/lib/components/chat/Messages/ResponseMessage.svelte
++++ b/src/lib/components/chat/Messages/ResponseMessage.svelte
+@@ -814,7 +814,7 @@
+ 
+ 										<button
+ 											id="confirm-edit-message-button"
+-											class="px-2.5 py-1 bg-gray-900 dark:bg-white hover:bg-gray-850 text-gray-100 dark:text-gray-800 transition rounded-3xl"
++											class="px-2.5 py-1 bg-gray-900 dark:bg-white hover:bg-gray-850 text-gray-100 dark:text-black transition rounded-3xl"
+ 											on:click={() => {
+ 												editMessageConfirmHandler();
+ 											}}
+diff --git a/src/lib/components/chat/Messages/UserMessage.svelte b/src/lib/components/chat/Messages/UserMessage.svelte
+index 5768234d9..b4a2bc7a4 100644
+--- a/src/lib/components/chat/Messages/UserMessage.svelte
++++ b/src/lib/components/chat/Messages/UserMessage.svelte
+@@ -333,7 +333,7 @@
+ 
+ 							<button
+ 								id="confirm-edit-message-button"
+-								class="px-2.5 py-1 bg-gray-900 dark:bg-white hover:bg-gray-850 text-gray-100 dark:text-gray-800 transition rounded-3xl"
++								class="px-2.5 py-1 bg-gray-900 dark:bg-white hover:bg-gray-850 text-gray-100 dark:text-black transition rounded-3xl"
+ 								on:click={() => {
+ 									editMessageConfirmHandler();
+ 								}}
+diff --git a/src/lib/components/common/ConfirmDialog.svelte b/src/lib/components/common/ConfirmDialog.svelte
+index c1d2a5e0d..80e4cab44 100644
+--- a/src/lib/components/common/ConfirmDialog.svelte
++++ b/src/lib/components/common/ConfirmDialog.svelte
+@@ -200,7 +200,7 @@
+ 						{cancelLabel}
+ 					</button>
+ 					<button
+-						class="text-sm bg-gray-900 hover:bg-gray-900/90 text-gray-100 dark:bg-gray-100 dark:hover:bg-gray-100/90 dark:text-gray-800 font-normal w-full py-1.5 rounded-full transition"
++						class="text-sm bg-gray-900 hover:bg-gray-900/90 text-gray-100 dark:bg-gray-100 dark:hover:bg-gray-100/90 dark:text-black font-normal w-full py-1.5 rounded-full transition"
+ 						on:click={() => {
+ 							confirmHandler();
+ 						}}
+-- 
+2.43.0
+

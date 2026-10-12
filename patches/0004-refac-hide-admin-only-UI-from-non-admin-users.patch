@@ -1,0 +1,67 @@
+From 127839da5d1fedb9929666ac0ff36736ec4812ab Mon Sep 17 00:00:00 2001
+From: Dani Aprilyanto <daniaprilyanto35@gmail.com>
+Date: Fri, 2 Oct 2026 01:37:35 +0000
+Subject: [PATCH 04/12] refac: hide admin-only UI from non-admin users
+
+Show the model id tooltip and the About settings tab only to admins, with a fallback to the general tab when the active tab is unavailable.
+---
+ .../components/chat/ModelSelector/ModelItem.svelte   |  5 ++++-
+ src/lib/components/chat/SettingsModal.svelte         | 12 +++++++++++-
+ 2 files changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/src/lib/components/chat/ModelSelector/ModelItem.svelte b/src/lib/components/chat/ModelSelector/ModelItem.svelte
+index b15041b08..8db53940d 100644
+--- a/src/lib/components/chat/ModelSelector/ModelItem.svelte
++++ b/src/lib/components/chat/ModelSelector/ModelItem.svelte
+@@ -112,7 +112,10 @@
+ 			</div>
+ 
+ 			<div class="flex min-w-0 items-center">
+-				<Tooltip content={`${item.label} (${item.value})`} placement="top-start">
++				<Tooltip
++					content={$user?.role === 'admin' ? `${item.label} (${item.value})` : item.label}
++					placement="top-start"
++				>
+ 					<div class="line-clamp-1">
+ 						{item.label}
+ 					</div>
+diff --git a/src/lib/components/chat/SettingsModal.svelte b/src/lib/components/chat/SettingsModal.svelte
+index 2557290d4..c09ae8649 100644
+--- a/src/lib/components/chat/SettingsModal.svelte
++++ b/src/lib/components/chat/SettingsModal.svelte
+@@ -401,6 +401,10 @@
+ 				);
+ 			}
+ 
++			if (tab.id === 'about') {
++				return $user?.role === 'admin';
++			}
++
+ 			return true;
+ 		});
+ 
+@@ -503,6 +507,12 @@
+ 	$: if ($config && $user) {
+ 		availableSettings = getAvailableSettings(allSettings, adminSettings);
+ 	}
++
++	// Safety net: if the active tab is not available for this user (e.g. a hidden
++	// admin-only tab such as About, or a deep-link), fall back to 'general'.
++	$: if (availableSettings.length > 0 && !availableSettings.some((tab) => tab.id === selectedTab)) {
++		selectedTab = 'general';
++	}
+ </script>
+ 
+ <Modal
+@@ -848,7 +858,7 @@
+ 						toast.success($i18n.t('Settings saved successfully!'));
+ 					}}
+ 				/>
+-			{:else if selectedTab === 'about'}
++			{:else if selectedTab === 'about' && $user?.role === 'admin'}
+ 				<About />
+ 			{:else if selectedTab === 'admin:general'}
+ 				<AdminGeneral saveHandler={adminConfigSaveHandler} />
+-- 
+2.43.0
+

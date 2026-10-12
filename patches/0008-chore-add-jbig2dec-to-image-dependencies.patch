@@ -1,0 +1,25 @@
+From 146d17195024731b24e2f09951d8e2694e8c5fc6 Mon Sep 17 00:00:00 2001
+From: Dani Aprilyanto <daniaprilyanto35@gmail.com>
+Date: Wed, 7 Oct 2026 15:49:35 +0000
+Subject: [PATCH 08/12] chore: add jbig2dec to image dependencies
+
+---
+ Dockerfile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Dockerfile b/Dockerfile
+index 94bc5f92e..f42de8a68 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -144,7 +144,7 @@ RUN apt-get update && \
+     curl jq ca-certificates \
+     && if [ "$USE_SLIM" != "true" ]; then \
+     apt-get install -y --no-install-recommends \
+-    git build-essential pandoc gcc libmariadb-dev ffmpeg libsm6 libxext6; \
++    git build-essential pandoc gcc libmariadb-dev ffmpeg libsm6 libxext6 jbig2dec; \
+     fi && if [ "$USE_OLLAMA" = "true" ]; then \
+     apt-get install -y --no-install-recommends zstd; \
+     fi && rm -rf /var/lib/apt/lists/*
+-- 
+2.43.0
+

@@ -1,0 +1,88 @@
+From 2c150a04c7ad67520239e1d62b293d906b590455 Mon Sep 17 00:00:00 2001
+From: Dani Aprilyanto <daniaprilyanto35@gmail.com>
+Date: Mon, 12 Oct 2026 03:38:52 +0000
+Subject: [PATCH 11/12] refac: make OAuth tool connection opt-in
+
+Stop auto-redirecting to OAuth on chat load and show a Connect badge for unauthenticated tools.
+---
+ src/lib/components/chat/Chat.svelte           | 21 +------------------
+ .../chat/MessageInput/IntegrationsMenu.svelte | 16 +++++++++++---
+ 2 files changed, 14 insertions(+), 23 deletions(-)
+
+diff --git a/src/lib/components/chat/Chat.svelte b/src/lib/components/chat/Chat.svelte
+index fd0e1bbac..ad0f8e91b 100644
+--- a/src/lib/components/chat/Chat.svelte
++++ b/src/lib/components/chat/Chat.svelte
+@@ -948,25 +948,6 @@
+ 		console.log('saveSessionSelectedModels', selectedModels, sessionStorage.selectedModels);
+ 	};
+ 
+-	const continueOAuthRedirect = async () => {
+-		if (pendingOAuthTools.length === 0) {
+-			sessionStorage.removeItem('oauthRedirectInProgressToolId');
+-			return;
+-		}
+-
+-		if (chatIdProp) {
+-			return;
+-		}
+-
+-		const nextTool = pendingOAuthTools[0];
+-		if (sessionStorage.getItem('oauthRedirectInProgressToolId') === nextTool.id) {
+-			sessionStorage.removeItem('oauthRedirectInProgressToolId');
+-			return;
+-		}
+-
+-		await oauthRedirectHandler(nextTool);
+-	};
+-
+ 	const resetInput = async () => {
+ 		selectedToolIds = [];
+ 		selectedSkillIds = [];
+@@ -1051,8 +1032,8 @@
+ 						}
+ 					}
+ 					selectedToolIds = authed;
++					// OAuth tools stay as opt-in "Click to connect" badges; never auto-redirect on chat load.
+ 					pendingOAuthTools = unauthed;
+-					await continueOAuthRedirect();
+ 				} else if ($settings?.tools) {
+ 					selectedToolIds = $settings.tools;
+ 				} else {
+diff --git a/src/lib/components/chat/MessageInput/IntegrationsMenu.svelte b/src/lib/components/chat/MessageInput/IntegrationsMenu.svelte
+index ad2a3109a..d7d81008c 100644
+--- a/src/lib/components/chat/MessageInput/IntegrationsMenu.svelte
++++ b/src/lib/components/chat/MessageInput/IntegrationsMenu.svelte
+@@ -43,6 +43,7 @@
+ 	import ChevronRight from '$lib/components/icons/ChevronRight.svelte';
+ 	import ChevronLeft from '$lib/components/icons/ChevronLeft.svelte';
+ 	import LinkSlash from '$lib/components/icons/LinkSlash.svelte';
++	import Link from '$lib/components/icons/Link.svelte';
+ 
+ 	const i18n = getContext('i18n') as any;
+ 
+@@ -643,9 +644,18 @@
+ 											</div>
+ 										{/if}
+ 
+-										<div class=" shrink-0" inert>
+-											<Switch state={selectedToolIds.includes(toolId)} />
+-										</div>
++										{#if !(tools?.[toolId]?.authenticated ?? true)}
++											<div
++												class="relative z-20 shrink-0 flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[0.6875rem] font-medium text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-400/10 border border-amber-200/40 dark:border-amber-500/20"
++											>
++												<Link className="size-3" strokeWidth="1.75" />
++												<span>{$i18n.t('Connect')}</span>
++											</div>
++										{:else}
++											<div class=" shrink-0" inert>
++												<Switch state={selectedToolIds.includes(toolId)} />
++											</div>
++										{/if}
+ 									</button>
+ 								{/each}
+ 							</div>
+-- 
+2.43.0
+

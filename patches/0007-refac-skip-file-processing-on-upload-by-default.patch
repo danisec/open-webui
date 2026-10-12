@@ -1,0 +1,25 @@
+From 5148bb7d248f97b5babba7e0968d46f3cf0610fe Mon Sep 17 00:00:00 2001
+From: Dani Aprilyanto <daniaprilyanto35@gmail.com>
+Date: Wed, 7 Oct 2026 15:49:35 +0000
+Subject: [PATCH 07/12] refac: skip file processing on upload by default
+
+---
+ src/lib/components/chat/MessageInput.svelte | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/lib/components/chat/MessageInput.svelte b/src/lib/components/chat/MessageInput.svelte
+index e6b746e3d..2d0bd41c4 100644
+--- a/src/lib/components/chat/MessageInput.svelte
++++ b/src/lib/components/chat/MessageInput.svelte
+@@ -915,7 +915,7 @@
+ 		);
+ 	};
+ 
+-	const uploadFileHandler = async (file, process = true, itemData = {}) => {
++	const uploadFileHandler = async (file, process = false, itemData = {}) => {
+ 		if ($_user?.role !== 'admin' && !($_user?.permissions?.chat?.file_upload ?? true)) {
+ 			toast.error($i18n.t('You do not have permission to upload files.'));
+ 			return null;
+-- 
+2.43.0
+

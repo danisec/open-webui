@@ -1,0 +1,128 @@
+From 1b9a4722eab5bcad4fba2aeed8ac9fa8b20ee717 Mon Sep 17 00:00:00 2001
+From: Dani Aprilyanto <daniaprilyanto35@gmail.com>
+Date: Fri, 2 Oct 2026 01:37:35 +0000
+Subject: [PATCH 03/12] feat: allow deleting models from admin settings
+
+Add a delete action to the model menu with a confirmation dialog, wired to deleteModelById.
+---
+ .../components/admin/Settings/Models.svelte   | 35 +++++++++++++++++--
+ .../admin/Settings/Models/ModelMenu.svelte    | 14 ++++++++
+ 2 files changed, 47 insertions(+), 2 deletions(-)
+
+diff --git a/src/lib/components/admin/Settings/Models.svelte b/src/lib/components/admin/Settings/Models.svelte
+index 42bf61a37..6393afe57 100644
+--- a/src/lib/components/admin/Settings/Models.svelte
++++ b/src/lib/components/admin/Settings/Models.svelte
+@@ -18,6 +18,7 @@
+ 	import {
+ 		createNewModel,
+ 		deleteAllModels,
++		deleteModelById,
+ 		getAllModels,
+ 		getModelById,
+ 		exportModels,
+@@ -96,6 +97,8 @@
+ 
+ 	let showManageModal = false;
+ 	let showResetModal = false;
++	let showModelDeleteConfirm = false;
++	let deleteTargetModel: ModelListItem | null = null;
+ 	let savingModelOrder = false;
+ 	let savingModelsSettings = false;
+ 	let modelOrderDirty = false;
+@@ -669,16 +672,28 @@
+ 		await updateUserSettings(localStorage.token, { ui: { pinnedModels: $settings.pinnedModels } });
+ 	};
+ 
++	const deleteModelHandler = async (model: ModelListItem) => {
++		const res = await deleteModelById(localStorage.token, model.id).catch((e) => {
++			toast.error(`${e}`);
++			return null;
++		});
++
++		if (res) {
++			toast.success($i18n.t(`Deleted {{name}}`, { name: model.id }));
++			await init();
++		}
++	};
++
+ 	onMount(async () => {
+ 		await init();
+ 
+-		const onKeyDown = (event) => {
++		const onKeyDown = (event: KeyboardEvent) => {
+ 			if (event.key === 'Shift') {
+ 				shiftKey = true;
+ 			}
+ 		};
+ 
+-		const onKeyUp = (event) => {
++		const onKeyUp = (event: KeyboardEvent) => {
+ 			if (event.key === 'Shift') {
+ 				shiftKey = false;
+ 			}
+@@ -719,6 +734,18 @@
+ 	}}
+ />
+ 
++<ConfirmDialog
++	title={$i18n.t('Delete Model')}
++	message={$i18n.t('Are you sure you want to delete this model? This cannot be undone.')}
++	bind:show={showModelDeleteConfirm}
++	onConfirm={async () => {
++		if (deleteTargetModel) {
++			await deleteModelHandler(deleteTargetModel);
++			deleteTargetModel = null;
++		}
++	}}
++/>
++
+ <ManageModelsModal bind:show={showManageModal} />
+ 
+ {#if models !== null}
+@@ -1215,6 +1242,10 @@
+ 										cloneHandler={() => {
+ 											cloneHandler(model);
+ 										}}
++										deleteHandler={() => {
++											deleteTargetModel = model;
++											showModelDeleteConfirm = true;
++										}}
+ 										onClose={() => {}}
+ 									>
+ 										<button
+diff --git a/src/lib/components/admin/Settings/Models/ModelMenu.svelte b/src/lib/components/admin/Settings/Models/ModelMenu.svelte
+index f9c9b4ff0..e456a8782 100644
+--- a/src/lib/components/admin/Settings/Models/ModelMenu.svelte
++++ b/src/lib/components/admin/Settings/Models/ModelMenu.svelte
+@@ -36,6 +36,7 @@
+ 	export let pinModelHandler: Function;
+ 	export let copyLinkHandler: Function;
+ 	export let cloneHandler: Function;
++	export let deleteHandler: Function = null;
+ 
+ 	export let onClose: Function;
+ 
+@@ -216,6 +217,19 @@
+ 
+ 				<div class="flex items-center">{$i18n.t('Export')}</div>
+ 			</button>
++
++			{#if deleteHandler}
++				<hr class="mx-1 my-0.5 border-gray-100 dark:border-gray-800" />
++
++				<button
++					class="select-none flex w-full gap-2 items-center h-[1.6875rem] px-2 text-[0.8125rem] font-normal cursor-pointer text-red-600 hover:bg-red-50/60 dark:text-red-400 dark:hover:bg-red-900/20 rounded-xl"
++					on:click={() => runAndClose(deleteHandler)}
++				>
++					<GarbageBin />
++
++					<div class="flex items-center">{$i18n.t('Delete')}</div>
++				</button>
++			{/if}
+ 		</DropdownMenu>
+ 	</div>
+ </Dropdown>
+-- 
+2.43.0
+
