@@ -979,7 +979,8 @@ html.high-contrast.dark
 		color: var(--color-gray-700);
 	}
 
-	html:where(.high-contrast).dark :is(.dark\:text-gray-700, .dark\:text-gray-800) {
+	html:where(.high-contrast).dark
+		:is(.dark\:text-gray-700, .dark\:text-gray-800):not(.dark\:bg-white):not(.dark\:bg-gray-100) {
 		color: var(--color-gray-300);
 	}
 
