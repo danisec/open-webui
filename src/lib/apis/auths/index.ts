@@ -309,7 +309,7 @@ export const updateOAuthConfig = async (token: string, body: object) => {
 	return res;
 };
 
-export const userSignIn = async (email: string, password: string) => {
+export const userSignIn = async (email: string, password: string, turnstileToken?: string) => {
 	let error = null;
 
 	const res = await fetch(`${WEBUI_API_BASE_URL}/auths/signin`, {
@@ -320,7 +320,8 @@ export const userSignIn = async (email: string, password: string) => {
 		credentials: 'include',
 		body: JSON.stringify({
 			email: email,
-			password: password
+			password: password,
+			...(turnstileToken ? { turnstile_token: turnstileToken } : {})
 		})
 	})
 		.then(async (res) => {

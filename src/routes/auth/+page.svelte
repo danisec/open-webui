@@ -48,6 +48,87 @@
 
 	let submitting = false;
 
+	// --- Cloudflare Turnstile (optional bot gate for password sign-in) ---
+	$: turnstileEnabled = Boolean($config?.features?.turnstile?.enabled);
+	$: turnstileSiteKey = $config?.features?.turnstile?.site_key ?? '';
+
+	let turnstileToken = '';
+	let turnstileWidgetId: string | null = null;
+	let turnstileContainer: HTMLDivElement | null = null;
+	let turnstileScriptPromise: Promise<void> | null = null;
+
+	const loadTurnstileScript = () => {
+		if (typeof window === 'undefined') return Promise.resolve();
+		if ((window as any).turnstile) return Promise.resolve();
+		if (turnstileScriptPromise) return turnstileScriptPromise;
+
+		turnstileScriptPromise = new Promise<void>((resolve, reject) => {
+			const existing = document.querySelector<HTMLScriptElement>('script[data-turnstile]');
+			if (existing) {
+				existing.addEventListener('load', () => resolve());
+				existing.addEventListener('error', () => reject(new Error('turnstile script failed')));
+				return;
+			}
+			const script = document.createElement('script');
+			script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+			script.async = true;
+			script.defer = true;
+			script.dataset.turnstile = 'true';
+			script.onload = () => resolve();
+			script.onerror = () => reject(new Error('turnstile script failed'));
+			document.head.appendChild(script);
+		});
+
+		return turnstileScriptPromise;
+	};
+
+	const renderTurnstile = async () => {
+		if (!turnstileEnabled || !turnstileSiteKey || !turnstileContainer) return;
+		if (turnstileWidgetId) return;
+
+		try {
+			await loadTurnstileScript();
+		} catch (error) {
+			console.error(error);
+			return;
+		}
+
+		const ts = (window as any).turnstile;
+		if (!ts || typeof ts.render !== 'function') return;
+
+		turnstileWidgetId = ts.render(turnstileContainer, {
+			sitekey: turnstileSiteKey,
+			theme: document.documentElement.classList.contains('dark') ? 'dark' : 'light',
+			appearance: 'interaction-only',
+			callback: (token: string) => {
+				turnstileToken = token;
+			},
+			'expired-callback': () => {
+				turnstileToken = '';
+			},
+			'error-callback': () => {
+				turnstileToken = '';
+			}
+		});
+	};
+
+	const resetTurnstile = () => {
+		turnstileToken = '';
+		const ts = (window as any).turnstile;
+		if (ts && turnstileWidgetId) {
+			try {
+				ts.reset(turnstileWidgetId);
+			} catch {
+				// widget may already be gone
+			}
+		}
+	};
+
+	$: if (turnstileEnabled && loaded && mode === 'signin') {
+		// Render after the container is bound to the DOM.
+		queueMicrotask(() => renderTurnstile());
+	}
+
 	const setSessionUser = async (sessionUser, redirectPath: string | null = null) => {
 		if (sessionUser) {
 			if (sessionUser.next_step === 'pending') {
@@ -84,10 +165,20 @@
 	};
 
 	const signInHandler = async () => {
-		const sessionUser = await userSignIn(email, password).catch((error) => {
+		if (turnstileEnabled && !turnstileToken) {
+			toast.error($i18n.t('Please complete the verification challenge.'));
+			return;
+		}
+
+		const sessionUser = await userSignIn(email, password, turnstileToken).catch((error) => {
 			toast.error(`${error}`);
 			return null;
 		});
+
+		if (!sessionUser) {
+			// Token is single-use: ask for a fresh challenge after a failed attempt.
+			resetTurnstile();
+		}
 
 		await setSessionUser(sessionUser);
 	};
@@ -434,6 +525,11 @@
 												/>
 											</div>
 										{/if}
+									</div>
+								{/if}
+								{#if turnstileEnabled && mode === 'signin'}
+									<div class="mt-4 flex justify-center">
+										<div bind:this={turnstileContainer}></div>
 									</div>
 								{/if}
 								<div class="mt-5">

@@ -287,6 +287,7 @@ from open_webui.utils.tool_approval import (
     resolve_tool_call_output,
 )
 from open_webui.utils.tools import set_terminal_servers, set_tool_servers
+from open_webui.utils.turnstile import public_turnstile_config
 
 if SAFE_MODE:
     print('SAFE MODE ENABLED')
@@ -2398,6 +2399,7 @@ async def get_app_config(request: Request):
             'enable_ldap': config.get('ldap.enable'),
             'enable_signup': config.get('ui.enable_signup'),
             'enable_login_form': config.get('ui.enable_login_form'),
+            'turnstile': public_turnstile_config(),
             'enable_websocket': ENABLE_WEBSOCKET_SUPPORT,
             **(
                 {'websocket_heartbeat_interval': WEBSOCKET_HEARTBEAT_INTERVAL}

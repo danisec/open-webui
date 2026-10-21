@@ -173,6 +173,7 @@ SigninResult = SessionUserResponse | MfaChallengeResponse | PendingUserResponse
 class SigninForm(BaseModel):
     email: str
     password: str
+    turnstile_token: str | None = None
 
 
 class LdapForm(BaseModel):

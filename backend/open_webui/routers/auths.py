@@ -82,6 +82,7 @@ from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.mfa import MFA_CONFIG_KEYS, MfaConfigForm, get_mfa_config, limit_account, update_mfa_config
 from open_webui.utils.misc import parse_duration, validate_email_format
 from open_webui.utils.rate_limit import RateLimiter
+from open_webui.utils.turnstile import is_turnstile_enabled, verify_turnstile_token
 from pydantic import BaseModel, StrictStr, field_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -758,6 +759,15 @@ async def signin(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail=ERROR_MESSAGES.RATE_LIMIT_EXCEEDED,
             )
+
+        # Bot gate: only enforced when Turnstile is enabled and fully configured.
+        if is_turnstile_enabled():
+            remote_ip = request.client.host if request.client else None
+            if not await verify_turnstile_token(form_data.turnstile_token, remote_ip):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=ERROR_MESSAGES.INVALID_CRED,
+                )
 
         if (await get_mfa_config()).ENABLE_MFA:
             existing = await Users.get_user_by_email(form_data.email.lower(), db=db)
