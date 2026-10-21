@@ -10,6 +10,7 @@
 	import Link from '$lib/components/icons/Link.svelte';
 	import Pencil from '$lib/components/icons/Pencil.svelte';
 	import { config, pinnedModels, settings, showSettings, user } from '$lib/stores';
+	import { getModelAlias } from '$lib/utils';
 	import GlobeAlt from '$lib/components/icons/GlobeAlt.svelte';
 
 	const i18n = getContext('i18n');
@@ -159,7 +160,7 @@
 						e.preventDefault();
 
 						window.open(
-							`https://openwebui.com/models?q=${encodeURIComponent(model?.id ?? '')}`,
+							`https://openwebui.com/models?q=${encodeURIComponent(getModelAlias(model?.id ?? ''))}`,
 							'_blank'
 						);
 						show = false;

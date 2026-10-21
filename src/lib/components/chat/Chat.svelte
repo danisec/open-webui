@@ -56,6 +56,7 @@
 		resolveDefaultModelIds,
 		convertMessagesToHistory,
 		copyToClipboard,
+		getModelAlias,
 		getMessageContentParts,
 		createMessagesList,
 		getDeepestChildId,
@@ -2507,6 +2508,13 @@
 			}
 		};
 
+		const resolveModelIdFromUrl = (value: string) => {
+			// Exact id first (older links), then a unique alias (last path segment).
+			if ($models.some((m) => m.id === value)) return value;
+			const aliasMatches = $models.filter((m) => getModelAlias(m.id) === value);
+			return aliasMatches.length === 1 ? aliasMatches[0].id : null;
+		};
+
 		if ($page.url.searchParams.get('models') || $page.url.searchParams.get('model')) {
 			const urlModels = (
 				$page.url.searchParams.get('models') ||
@@ -2514,17 +2522,15 @@
 				''
 			)?.split(',');
 
-			if (urlModels.length === 1) {
-				if (!$models.find((m) => m.id === urlModels[0])) {
-					// Model not found; open model selector and prefill
-					await openModelSelectorWithSearch(urlModels[0]);
-				} else {
-					// Model found; set it as selected
-					selectedModels = urlModels;
-				}
-			} else {
-				// Multiple models; set as selected
-				selectedModels = urlModels;
+			const resolvedModels = urlModels
+				.map((value) => resolveModelIdFromUrl(value))
+				.filter((id): id is string => Boolean(id));
+
+			if (urlModels.length === 1 && resolvedModels.length === 0) {
+				// Unknown or ambiguous model; open model selector and prefill
+				await openModelSelectorWithSearch(urlModels[0]);
+			} else if (resolvedModels.length > 0) {
+				selectedModels = resolvedModels;
 			}
 
 			// Unavailable models filtering

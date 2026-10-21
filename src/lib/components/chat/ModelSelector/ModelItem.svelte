@@ -8,7 +8,7 @@
 	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL } from '$lib/constants';
 
 	import Tooltip from '$lib/components/common/Tooltip.svelte';
-	import { copyToClipboard, sanitizeResponseContent } from '$lib/utils';
+	import { copyToClipboard, getModelAlias, sanitizeResponseContent } from '$lib/utils';
 	import { resolveLocalizedModelDescription } from '$lib/utils/localizedContent';
 	import ArrowUpTray from '$lib/components/icons/ArrowUpTray.svelte';
 	import Check from '$lib/components/icons/Check.svelte';
@@ -39,7 +39,9 @@
 
 	const copyLinkHandler = async (model) => {
 		const baseUrl = window.location.origin;
-		const res = await copyToClipboard(`${baseUrl}/?model=${encodeURIComponent(model.id)}`);
+		const res = await copyToClipboard(
+			`${baseUrl}/?model=${encodeURIComponent(getModelAlias(model.id))}`
+		);
 
 		if (res) {
 			toast.success($i18n.t('Copied link to clipboard'));

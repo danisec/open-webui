@@ -1198,6 +1198,9 @@ export const extractSentencesForAudio = (text: string) => {
 	}, [] as string[]);
 };
 
+export const getModelAlias = (id: string | null | undefined): string =>
+	(id ?? '').split('/').filter(Boolean).pop() ?? '';
+
 export const getMessageContentParts = (content: string, splitOn: string = 'punctuation') => {
 	// Strip <details> blocks directly on the full string before any
 	// code-block-aware processing. removeAllDetails (which callers use)
