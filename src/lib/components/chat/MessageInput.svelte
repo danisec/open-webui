@@ -63,7 +63,7 @@
 		isRasterImageContentType
 	} from '$lib/utils';
 	import { uploadFile } from '$lib/apis/files';
-	import { getCwd, uploadNewFileToTerminal } from '$lib/apis/terminal';
+	import { getCwd, uploadNewFileToTerminal, getLightragUploadStatus } from '$lib/apis/terminal';
 	import { generateAutoCompletion } from '$lib/apis';
 	import { deleteFileById } from '$lib/apis/files';
 	import { getChatById } from '$lib/apis/chats';
@@ -919,17 +919,32 @@
 		servers: any[] | null = $terminalServers,
 		settingsValue: any = $settings
 	) => {
-		if (!selectedId) return null;
+		const systemTerminals = servers ?? [];
+		const personalTerminals = settingsValue?.terminalServers ?? [];
 
-		const systemTerminal = (servers ?? []).find(
-			(t: any) => t.id && t.id === selectedId && t.config?.chat_uploads === 'filesystem'
+		// 1) the explicitly selected terminal, if it is filesystem-capable
+		if (selectedId) {
+			const selectedSystem = systemTerminals.find(
+				(t: any) => t.id && t.id === selectedId && t.config?.chat_uploads === 'filesystem'
+			);
+			if (selectedSystem) return selectedSystem;
+
+			const selectedPersonal = personalTerminals.find(
+				(t: any) => t.url === selectedId && t.enabled && t.config?.chat_uploads === 'filesystem'
+			);
+			if (selectedPersonal) return selectedPersonal;
+		}
+
+		// 2) otherwise default to the user's first filesystem-capable terminal, so chat
+		// uploads always land in that user's workspace without a manual selection.
+		const defaultSystem = systemTerminals.find(
+			(t: any) => t.id && t.config?.chat_uploads === 'filesystem'
 		);
-		if (systemTerminal) return systemTerminal;
+		if (defaultSystem) return defaultSystem;
 
 		return (
-			(settingsValue?.terminalServers ?? []).find(
-				(t: any) => t.url === selectedId && t.enabled && t.config?.chat_uploads === 'filesystem'
-			) ?? null
+			personalTerminals.find((t: any) => t.enabled && t.config?.chat_uploads === 'filesystem') ??
+			null
 		);
 	};
 
@@ -992,6 +1007,7 @@
 				if (uploadedFile) {
 					fileItem.type = 'filesystem';
 					fileItem.status = 'uploaded';
+					fileItem.indexStatus = 'indexing';
 					fileItem.name = uploadedFile.path.split('/').pop() || file.name;
 					fileItem.id = uploadedFile.path;
 					fileItem.path = uploadedFile.path;
@@ -1381,6 +1397,72 @@
 	const onBlur = () => {
 		shiftKey = false;
 	};
+
+	let indexPollTimer: ReturnType<typeof setTimeout> | null = null;
+	let indexPollStarted = 0;
+	const INDEX_POLL_MS = 15000;
+	const INDEX_POLL_MAX_MS = 60 * 60 * 1000;
+
+	const lightragStateOf = (status: string): '' | 'indexing' | 'indexed' | 'failed' => {
+		if (status === 'processed') return 'indexed';
+		if (status === 'failed') return 'failed';
+		if (
+			status === 'processing' ||
+			status === 'pending' ||
+			status === 'parsing' ||
+			status === 'analyzing'
+		)
+			return 'indexing';
+		return '';
+	};
+
+	const refreshIndexStatus = async () => {
+		if (indexPollTimer) clearTimeout(indexPollTimer);
+		indexPollTimer = null;
+
+		const pending = files.filter(
+			(f) =>
+				f?.type === 'filesystem' &&
+				f?.path &&
+				f?.indexStatus !== 'indexed' &&
+				f?.indexStatus !== 'failed'
+		);
+		if (!pending.length) return;
+
+		const statuses = await getLightragUploadStatus(
+			localStorage.token,
+			pending.map((f) => f.path)
+		);
+
+		files = files.map((f) => {
+			if (f?.type !== 'filesystem' || !f?.path || !(f.path in statuses)) return f;
+			const next = lightragStateOf(statuses[f.path].status);
+			return next ? { ...f, indexStatus: next } : f;
+		});
+
+		const stillBusy = files.some((f) => f?.type === 'filesystem' && f?.indexStatus === 'indexing');
+		if (stillBusy && Date.now() - indexPollStarted < INDEX_POLL_MAX_MS) {
+			indexPollTimer = setTimeout(refreshIndexStatus, INDEX_POLL_MS);
+		}
+	};
+
+	const startIndexPolling = () => {
+		if (indexPollTimer) return;
+		indexPollStarted = Date.now();
+		refreshIndexStatus();
+	};
+
+	$: if (
+		files.some(
+			(f) =>
+				f?.type === 'filesystem' &&
+				f?.path &&
+				f?.indexStatus !== 'indexed' &&
+				f?.indexStatus !== 'failed'
+		)
+	) {
+		startIndexPolling();
+	}
 
 	onMount(() => {
 		suggestions = [
@@ -2049,6 +2131,7 @@
 												name={file.name}
 												type={file.type}
 												size={file?.size}
+												indexStatus={file.indexStatus ?? ''}
 												loading={file.status === 'uploading'}
 												dismissible={true}
 												edit={true}

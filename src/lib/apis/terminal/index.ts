@@ -165,6 +165,19 @@ export type TerminalServer = {
 	};
 };
 
+export const getLightragUploadStatus = async (
+	token: string,
+	paths: string[]
+): Promise<Record<string, { status: string; chunks: number | null; error: string | null }>> => {
+	if (!paths.length) return {};
+	const res = await fetch(
+		`${WEBUI_API_BASE_URL}/terminals/lightrag/status?paths=${encodeURIComponent(paths.join(','))}`,
+		{ headers: { Authorization: `Bearer ${token}` } }
+	).catch(() => null);
+	if (!res || !res.ok) return {};
+	return res.json().catch(() => ({}));
+};
+
 export const getTerminalServers = async (token: string): Promise<TerminalServer[]> => {
 	if (!get(config)?.features?.enable_tool_servers) return [];
 	const res = await fetch(`${WEBUI_API_BASE_URL}/terminals/`, {

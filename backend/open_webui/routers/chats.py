@@ -1654,6 +1654,28 @@ async def send_chat_message_event_by_id(
 ############################
 
 
+def _terminal_upload_paths(chat) -> list[str]:
+    """Workspace paths of terminal (filesystem) uploads referenced by a chat.
+
+    Uploads with chat_uploads=filesystem live only in the user's terminal
+    workspace, so the chat.deleted handlers need these paths to clean up.
+    """
+    data = chat.chat if isinstance(chat.chat, dict) else {}
+    paths: set[str] = set()
+    for message in (data.get('history') or {}).get('messages', {}).values():
+        if not isinstance(message, dict):
+            continue
+        for item in message.get('files') or []:
+            if not isinstance(item, dict) or item.get('type') != 'filesystem':
+                continue
+            nested = item.get('file') if isinstance(item.get('file'), dict) else {}
+            for candidate in (item.get('path'), nested.get('path'), item.get('url'), item.get('id')):
+                if isinstance(candidate, str) and candidate.startswith('/'):
+                    paths.add(candidate)
+                    break
+    return sorted(paths)
+
+
 @router.delete('/{id}', response_model=bool)
 async def delete_chat_by_id(
     request: Request,
@@ -1691,6 +1713,10 @@ async def delete_chat_by_id(
         await stop_item_tasks(request.app.state.redis, child_id)
         await Chats.delete_chat_by_id_and_user_id(child_id, chat.user_id)
 
+    # Capture terminal-workspace files referenced by this chat's messages before
+    # the chat row is removed, so chat.deleted handlers can delete them.
+    terminal_paths = _terminal_upload_paths(chat)
+
     if user.role == 'admin':
         result = await Chats.delete_chat_by_id(id, db=db)
     else:
@@ -1702,7 +1728,7 @@ async def delete_chat_by_id(
             EVENTS.CHAT_DELETED,
             actor=user,
             subject_id=id,
-            data={'owner_id': chat.user_id},
+            data={'owner_id': chat.user_id, 'terminal_paths': terminal_paths},
         )
     return result
 

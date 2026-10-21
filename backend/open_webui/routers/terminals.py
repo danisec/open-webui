@@ -8,6 +8,7 @@ Routes:
 import asyncio
 import logging
 import posixpath
+import re
 from urllib.parse import unquote
 
 import aiohttp
@@ -24,8 +25,12 @@ from open_webui.utils.headers import bearer_auth_header, normalize_bearer_token
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.terminals import (
     TERMINAL_CONTEXT_HEADER,
+    delete_terminal_upload_from_lightrag,
+    forward_terminal_upload_to_lightrag,
     get_terminal_server_url,
     is_terminal_orchestrator,
+    lightrag_status_for_paths,
+    record_terminal_upload,
     terminal_chat_uploads,
     terminal_context_available,
     terminal_context_config,
@@ -84,6 +89,23 @@ def _sanitize_proxy_path(path: str) -> str | None:
     return cleaned
 
 
+@router.get('/lightrag/status')
+async def lightrag_upload_status(paths: str = '', user=Depends(get_verified_user)):
+    """Indexing status of the caller's own uploads. The workspace is always the caller's id."""
+    if not ENABLE_TOOL_SERVERS:
+        return {}
+    requested = [p.strip() for p in paths.split(',') if p.strip().startswith('/')][:50]
+    return await lightrag_status_for_paths(user.id, requested)
+
+
+def terminal_display_name(connection: dict, user) -> str:
+    """Admins keep the configured label; other users get it without the "(…)" suffix."""
+    name = (connection.get('name') or '').strip()
+    if user.role == 'admin':
+        return name or 'Open Terminal'
+    return re.sub(r'\s*\([^)]*\)\s*$', '', name).strip() or 'Open Terminal'
+
+
 @router.get('/')
 async def list_terminal_servers(request: Request, user=Depends(get_verified_user)):
     """Return terminal servers the authenticated user has access to."""
@@ -97,7 +119,7 @@ async def list_terminal_servers(request: Request, user=Depends(get_verified_user
         {
             'id': connection.get('id', ''),
             'url': connection.get('url', ''),
-            'name': connection.get('name', ''),
+            'name': terminal_display_name(connection, user),
             'contexts': terminal_contexts(connection),
             'config': {'chat_uploads': terminal_chat_uploads(connection)},
         }
@@ -242,7 +264,51 @@ async def proxy_terminal(
         await upstream_response.release()
         await session.close()
 
-        return Response(content=response_body, status_code=status_code, headers=filtered_headers)
+        # Remember terminal uploads so the chat-deleted cleanup can remove the
+        # workspace copy later. The upload response carries the stored path.
+        background = None
+        if status_code == 200 and request.method == 'POST' and safe_path.endswith('files/upload'):
+            uploaded_path = None
+            try:
+                uploaded = JSONCodec.loads(response_body)
+                uploaded_path = uploaded.get('path') if isinstance(uploaded, dict) else None
+            except Exception:
+                log.debug('Could not read terminal upload response for chat %s', session_id)
+
+            if isinstance(uploaded_path, str) and uploaded_path.startswith('/'):
+                if session_id:
+                    await record_terminal_upload(session_id, user.id, uploaded_path)
+
+                # Index it in LightRAG now. The bridge worker also sweeps chat
+                # uploads, but on a timer and only for files it has a registry row
+                # for; this covers every upload immediately.
+                background = BackgroundTask(
+                    forward_terminal_upload_to_lightrag,
+                    body,
+                    content_type,
+                    user.id,
+                    posixpath.basename(uploaded_path),
+                )
+
+        # A deleted workspace file has to leave LightRAG too, otherwise the graph
+        # keeps answering from a document the user removed. Deleting a directory
+        # is left to the bridge's reconciliation sweep, which still knows which
+        # files were in it.
+        if status_code < 300 and request.method == 'DELETE' and safe_path.endswith('files/delete'):
+            deleted_path = (request.query_params.get('path') or '').strip()
+            if deleted_path.startswith('/'):
+                background = BackgroundTask(
+                    delete_terminal_upload_from_lightrag,
+                    user.id,
+                    deleted_path,
+                )
+
+        return Response(
+            content=response_body,
+            status_code=status_code,
+            headers=filtered_headers,
+            background=background,
+        )
 
     except ClientDisconnect:
         await session.close()

@@ -1308,3 +1308,25 @@ OTEL_METRICS_OTLP_SPAN_EXPORTER = os.getenv(
 OTEL_LOGS_OTLP_SPAN_EXPORTER = os.getenv(
     'OTEL_LOGS_OTLP_SPAN_EXPORTER', OTEL_OTLP_SPAN_EXPORTER
 ).lower()  # grpc or http
+
+# --- LightRAG auto-indexing -------------------------------------------------
+# With LIGHTRAG_INDEX_URL set, a file uploaded into a terminal workspace is also
+# forwarded to that LightRAG server so it gets indexed without the user asking.
+# The workspace is the uploader's user id, which is how per-user isolation is
+# keyed; the URL is expected to be the bearer-auth proxy in front of the
+# LightRAG API (it serves POST /documents/upload).
+LIGHTRAG_INDEX_URL = os.getenv('LIGHTRAG_INDEX_URL', '').rstrip('/')
+LIGHTRAG_INDEX_TOKEN = os.getenv('LIGHTRAG_INDEX_TOKEN', '')
+LIGHTRAG_INDEX_TIMEOUT = int(os.getenv('LIGHTRAG_INDEX_TIMEOUT', '600'))
+LIGHTRAG_INDEX_EXTS = {
+    ext.strip().lower().lstrip('.')
+    for ext in os.getenv(
+        'LIGHTRAG_INDEX_EXTS',
+        'pdf,txt,md,markdown,docx,pptx,xlsx,csv,html,htm,json,rtf,odt,epub',
+    ).split(',')
+    if ext.strip()
+}
+# Files at or above this size are indexed without knowledge-graph extraction.
+# Extraction is what makes large documents take hours, and a graph is rarely
+# worth that on a whole book; chunk retrieval (naive/mix) still works. 0 disables.
+LIGHTRAG_SKIP_KG_OVER_MB = float(os.getenv('LIGHTRAG_SKIP_KG_OVER_MB', '0'))

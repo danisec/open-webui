@@ -11,7 +11,7 @@
 	import Tooltip from './Tooltip.svelte';
 	import XMark from '$lib/components/icons/XMark.svelte';
 
-	const i18n = getContext('i18n');
+	const i18n: any = getContext('i18n');
 	const dispatch = createEventDispatcher();
 
 	export let className = 'w-60';
@@ -30,6 +30,7 @@
 	export let name: string;
 	export let type: string;
 	export let size: number;
+	export let indexStatus: '' | 'indexing' | 'indexed' | 'failed' = '';
 
 	import DocumentPage from '../icons/DocumentPage.svelte';
 	import Database from '../icons/Database.svelte';
@@ -174,7 +175,25 @@
 			<div class="flex min-w-0 flex-1 items-center overflow-hidden">
 				<div class="flex min-w-0 flex-1 items-center justify-between dark:text-gray-100">
 					<div class="min-w-0 flex-1 truncate pr-1 font-normal">{decodeString(name)}</div>
-					{#if size}
+					{#if indexStatus === 'indexing'}
+						<div
+							class="max-w-[45%] shrink-0 truncate text-[0.6875rem] text-amber-600 dark:text-amber-400"
+						>
+							{$i18n.t('Indexing')}…
+						</div>
+					{:else if indexStatus === 'indexed'}
+						<div
+							class="max-w-[45%] shrink-0 truncate text-[0.6875rem] text-emerald-600 dark:text-emerald-400"
+						>
+							{$i18n.t('Indexed')} ✓
+						</div>
+					{:else if indexStatus === 'failed'}
+						<div
+							class="max-w-[45%] shrink-0 truncate text-[0.6875rem] text-red-600 dark:text-red-400"
+						>
+							{$i18n.t('Indexing failed')}
+						</div>
+					{:else if size}
 						<div class="max-w-[35%] shrink-0 truncate text-[0.6875rem] capitalize text-gray-500">
 							{formatFileSize(size)}
 						</div>
