@@ -227,6 +227,20 @@
 		}
 	};
 
+	const IMAGE_FILE_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg', '.avif'];
+
+	// Tool results sometimes carry only {type: 'file', url, name}; render a preview
+	// when the URL/name clearly points at an image.
+	const isImageFile = (file: any) => {
+		if (!file) return false;
+		if (file.type === 'image') return true;
+		if ((file?.content_type ?? '').startsWith('image/')) return true;
+		const raw = String(file.url || file.name || '');
+		if (raw.startsWith('data:image/')) return true;
+		const path = raw.split('?')[0].split('#')[0].toLowerCase();
+		return IMAGE_FILE_EXTENSIONS.some((ext) => path.endsWith(ext));
+	};
+
 	const stopAudio = () => {
 		speakAbort?.abort();
 		speakAbort = null;
@@ -326,6 +340,8 @@
 					await $TTSWorker.init();
 				}
 
+				// Pre-generate the whole message before playback starts.
+				const urls: string[] = [];
 				for (const [, sentence] of messageContentParts.entries()) {
 					if (signal.aborted) return;
 
@@ -333,40 +349,56 @@
 						.generate({ text: sentence, voice: voiceId })
 						.catch((error) => {
 							console.error(error);
-							toast.error(`${error}`);
-							speaking = false;
-							loadingSpeech = false;
+							return null;
 						});
 
 					if (signal.aborted) return;
-
-					if (url && speaking) {
-						$audioQueue.enqueue(url);
-						loadingSpeech = false;
-					}
+					if (url) urls.push(url);
 				}
+
+				if (urls.length === 0) {
+					toast.error($i18n.t('Audio playback failed'));
+					speaking = false;
+					loadingSpeech = false;
+					return;
+				}
+
+				for (const url of urls) $audioQueue.enqueue(url);
+				$audioQueue?.markProducerDone();
+				loadingSpeech = false;
 			} else {
+				// Pre-synthesize the whole message before playback: the player then has
+				// every chunk up front and never runs dry mid-message.
+				const urls: string[] = [];
 				for (const [, sentence] of messageContentParts.entries()) {
-					if (signal.aborted) return;
+					if (signal.aborted) break;
 
-					const res = await synthesizeOpenAISpeech(localStorage.token, voiceId, sentence).catch(
-						(error) => {
-							console.error(error);
-							toast.error(`${error}`);
-							speaking = false;
-							loadingSpeech = false;
-						}
-					);
+					try {
+						const res = await synthesizeOpenAISpeech(localStorage.token, voiceId, sentence);
+						if (signal.aborted) break;
+						if (!res) continue;
 
-					if (signal.aborted) return;
-
-					if (res && speaking) {
 						const blob = await res.blob();
-						const url = URL.createObjectURL(blob);
-						$audioQueue.enqueue(url);
-						loadingSpeech = false;
+						if (blob.size) urls.push(URL.createObjectURL(blob));
+					} catch (error) {
+						// Skip this chunk and keep going: one failed sentence must not
+						// stop the rest of the message from being spoken.
+						console.error(error);
 					}
 				}
+
+				if (signal.aborted) return;
+
+				if (urls.length === 0) {
+					toast.error($i18n.t('Audio playback failed'));
+					speaking = false;
+					loadingSpeech = false;
+					return;
+				}
+
+				for (const url of urls) $audioQueue.enqueue(url);
+				$audioQueue?.markProducerDone();
+				loadingSpeech = false;
 			}
 		}
 	};
@@ -712,7 +744,7 @@
 							>
 								{#each message.files.filter((f) => ['image', 'file'].includes(f.type)) as file}
 									<div>
-										{#if file.type === 'image' || (file?.content_type ?? '').startsWith('image/')}
+										{#if file.type === 'image' || (file?.content_type ?? '').startsWith('image/') || isImageFile(file)}
 											<Image src={file.url} alt={file.name || $i18n.t('Generated Image')} />
 										{:else}
 											<FileItem
@@ -1133,12 +1165,10 @@
 												? 'visible'
 												: 'hover-reveal'} p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition"
 											on:click={() => {
-												if (!loadingSpeech) {
-													if (speaking) {
-														stopAudio();
-													} else {
-														speak();
-													}
+												if (loadingSpeech || speaking) {
+													stopAudio();
+												} else {
+													speak();
 												}
 											}}
 										>

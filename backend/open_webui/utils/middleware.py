@@ -1057,6 +1057,46 @@ async def apply_source_context_to_messages(
 
 BASE64_IMAGE_DATA_URI_RE = re.compile(r'data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/]+={0,2}', re.IGNORECASE)
 
+# Files served by the terminal/tool proxies are referenced by URL, not as data URIs.
+# Recognise them by extension or explicit image content type so the chat can render
+# a preview instead of a generic download card.
+IMAGE_FILE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg', '.avif')
+
+
+def is_image_file_url(url: Any) -> bool:
+    """True when a tool result URL/name points at a raster or SVG image."""
+    if not isinstance(url, str) or not url:
+        return False
+    if url.startswith('data:image/'):
+        return True
+    path = url.split('?', 1)[0].split('#', 1)[0].lower()
+    return path.endswith(IMAGE_FILE_EXTENSIONS)
+
+
+def normalize_tool_result_files(files: list) -> list:
+    """Mark image attachments so the frontend renders a preview.
+
+    Tool results often carry only ``{type: 'file', url, name}``; the chat UI shows a
+    preview only when ``type == 'image'`` (or ``content_type`` starts with image/).
+    """
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        content_type = item.get('content_type') or ''
+        is_image = (
+            item.get('type') == 'image'
+            or (isinstance(content_type, str) and content_type.startswith('image/'))
+            or is_image_file_url(item.get('url'))
+            or is_image_file_url(item.get('name'))
+        )
+        if is_image:
+            item['type'] = 'image'
+            if not content_type:
+                guessed = mimetypes.guess_type(str(item.get('url') or item.get('name') or ''))[0]
+                if guessed and guessed.startswith('image/'):
+                    item['content_type'] = guessed
+    return files
+
 
 def extract_base64_images(value: Any, files: list) -> Any:
     """Move base64 image data URIs out of a tool result so they do not reach the model as text."""
@@ -1293,6 +1333,9 @@ async def process_tool_result(
                     tool_result.remove(item)
 
     tool_result = extract_base64_images(tool_result, tool_result_files)
+
+    # Tool results may reference images by URL/name only; mark them so the UI previews them.
+    tool_result_files = normalize_tool_result_files(tool_result_files)
 
     if isinstance(tool_result, list):
         tool_result = {'results': tool_result}
@@ -2489,26 +2532,41 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             form_data['messages'] = [system_message, *db_messages] if system_message else db_messages
 
             # Inject image files into content as image_url parts (mirrors frontend logic)
+            from open_webui.utils.terminals import get_terminal_image_data_uri
+
             for message in form_data['messages']:
-                image_files = [
-                    f
-                    for f in message.get('files', [])
-                    if f.get('type') == 'image' or is_raster_image_content_type(f.get('content_type'))
+                if message.get('role') != 'user':
+                    continue
+
+                text_content = message.get('content', '')
+                if not isinstance(text_content, str):
+                    continue
+
+                files = [f for f in (message.get('files') or []) if isinstance(f, dict)]
+
+                image_urls = [
+                    f['url']
+                    for f in files
+                    if f.get('type') != 'filesystem'
+                    and f.get('url')
+                    and (f.get('type') == 'image' or is_raster_image_content_type(f.get('content_type')))
                 ]
-                if message.get('role') == 'user' and image_files:
-                    text_content = message.get('content', '')
-                    if isinstance(text_content, str):
-                        message['content'] = [
-                            {'type': 'text', 'text': text_content},
-                            *[
-                                {
-                                    'type': 'image_url',
-                                    'image_url': {'url': f['url']},
-                                }
-                                for f in image_files
-                                if f.get('url')
-                            ],
-                        ]
+
+                for f in files:
+                    if f.get('type') != 'filesystem':
+                        continue
+                    path = f.get('path') or f.get('url')
+                    if not isinstance(path, str):
+                        continue
+                    data_uri = await get_terminal_image_data_uri(request, user, metadata, path)
+                    if data_uri:
+                        image_urls.append(data_uri)
+
+                if image_urls:
+                    message['content'] = [
+                        {'type': 'text', 'text': text_content},
+                        *({'type': 'image_url', 'image_url': {'url': url}} for url in image_urls),
+                    ]
 
     if regeneration_prompt:
         form_data['messages'].append({'role': 'user', 'content': regeneration_prompt})
