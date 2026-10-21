@@ -29,7 +29,8 @@ export default defineConfig({
 		APP_BUILD_CHANNEL: JSON.stringify(buildInfo.channel)
 	},
 	build: {
-		sourcemap: true
+		// Production builds skip sourcemaps: smaller image, lower build memory.
+		sourcemap: false
 	},
 	server: {
 		proxy: {
