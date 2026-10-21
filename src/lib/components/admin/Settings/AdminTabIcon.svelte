@@ -9,6 +9,7 @@
 	import Lock from '$lib/components/icons/Lock.svelte';
 	import Photo from '$lib/components/icons/Photo.svelte';
 	import QueueList from '$lib/components/icons/QueueList.svelte';
+	import ArrowPath from '$lib/components/icons/ArrowPath.svelte';
 	import SettingsAlt from '$lib/components/icons/SettingsAlt.svelte';
 	import SoundHigh from '$lib/components/icons/SoundHigh.svelte';
 	import UserCircle from '$lib/components/icons/UserCircle.svelte';
@@ -53,6 +54,8 @@
 	</svg>
 {:else if id === 'subagents'}
 	<UserCircle {className} {strokeWidth} />
+{:else if id === 'model-rotator'}
+	<ArrowPath {className} {strokeWidth} />
 {:else if id === 'evaluations'}
 	<svg
 		aria-hidden="true"

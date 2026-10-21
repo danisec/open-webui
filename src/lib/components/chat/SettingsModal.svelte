@@ -48,6 +48,7 @@
 	import AdminAuthentication from '$lib/components/admin/Settings/Authentication.svelte';
 	import AdminConnections from '$lib/components/admin/Settings/Connections.svelte';
 	import AdminModels from '$lib/components/admin/Settings/Models.svelte';
+	import AdminModelRotator from '$lib/components/admin/Settings/ModelRotator.svelte';
 	import AdminSubagents from '$lib/components/admin/Settings/Subagents.svelte';
 	import AdminEvaluations from '$lib/components/admin/Settings/Evaluations.svelte';
 	import AdminAnalytics from '$lib/components/admin/Analytics.svelte';
@@ -161,6 +162,7 @@
 		'admin:interface': $i18n.t('System'),
 		'admin:connections': $i18n.t('AI'),
 		'admin:models': $i18n.t('AI'),
+		'admin:model-rotator': $i18n.t('AI'),
 		'admin:subagents': $i18n.t('AI'),
 		'admin:integrations': $i18n.t('Tools'),
 		'admin:documents': $i18n.t('Tools'),
@@ -295,6 +297,12 @@
 			titleKey: 'settings.admin.models.title',
 			title: $i18n.t('settings.admin.models.title'),
 			searchPrefixes: ['settings.admin.models.', 'settings.personal.general.parameters.']
+		},
+		{
+			id: 'admin:model-rotator',
+			titleKey: 'settings.admin.model-rotator.title',
+			title: $i18n.t('Model Rotator'),
+			searchPrefixes: ['settings.admin.model-rotator.']
 		},
 		{
 			id: 'admin:subagents',
@@ -867,6 +875,8 @@
 				/>
 			{:else if selectedTab === 'admin:models'}
 				<AdminModels bind:tabState />
+			{:else if selectedTab === 'admin:model-rotator'}
+				<AdminModelRotator />
 			{:else if selectedTab === 'admin:subagents'}
 				<AdminSubagents />
 			{:else if selectedTab === 'admin:evaluations'}
