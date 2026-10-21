@@ -40,6 +40,7 @@
 	export let copyLinkHandler: Function;
 	export let cloneHandler: Function;
 	export let testHandler: (() => void) | null = null;
+	export let deletePermanentlyHandler: (() => void) | null = null;
 
 	export let onClose: Function;
 
@@ -238,6 +239,20 @@
 					<Bolt className="size-3.5" />
 
 					<div class="flex items-center">{$i18n.t('Test Connection')}</div>
+				</button>
+			{/if}
+
+			{#if deletePermanentlyHandler}
+				<hr class="mx-1 my-0.5 border-gray-100 dark:border-gray-800" />
+
+				<button
+					class="select-none flex w-full gap-2 items-center h-[1.6875rem] px-2 text-[0.8125rem] font-normal cursor-pointer text-red-600 hover:bg-red-50/60 dark:text-red-400 dark:hover:bg-red-900/20 rounded-xl"
+					type="button"
+					on:click={() => runAndClose(deletePermanentlyHandler)}
+				>
+					<GarbageBin className="size-3.5" />
+
+					<div class="flex items-center">{$i18n.t('Delete permanently')}</div>
 				</button>
 			{/if}
 		</DropdownMenu>

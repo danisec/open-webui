@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import json
 import logging
 import posixpath
+import time
 from copy import deepcopy
 from typing import Optional
 from urllib.parse import unquote
@@ -23,6 +25,7 @@ from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.env import (
     BYPASS_MODEL_ACCESS_CONTROL,
+    DATA_DIR,
     ENABLE_PROFILE_IMAGE_URL_FORWARDING,
     PROFILE_IMAGE_ALLOWED_MIME_TYPES,
 )
@@ -1370,6 +1373,84 @@ async def delete_model_by_id(
             data={'name': model.name},
         )
     return result
+
+
+############################
+# DeleteModelPermanently
+############################
+
+
+@router.post('/model/delete/permanent')
+async def delete_model_permanently(
+    request: Request,
+    form_data: ModelIdForm,
+    user=Depends(get_admin_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """Remove the model from every provider connection and delete its saved record.
+
+    A model that is still listed by a connection keeps coming back after a plain
+    delete, so this also strips the id from openai.api_configs[*].model_ids.
+    """
+    model = await Models.get_model_by_id(form_data.id, db=db)
+
+    api_configs = await Config.get('openai.api_configs') or {}
+    updated_configs = deepcopy(api_configs)
+    previous_model_ids = {}
+
+    for key, api_config in updated_configs.items():
+        if not isinstance(api_config, dict):
+            continue
+        model_ids = api_config.get('model_ids')
+        if isinstance(model_ids, list) and form_data.id in model_ids:
+            previous_model_ids[key] = list(model_ids)
+            api_config['model_ids'] = [model_id for model_id in model_ids if model_id != form_data.id]
+
+    if model is None and not previous_model_ids:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ERROR_MESSAGES.NOT_FOUND,
+        )
+
+    backup = {
+        'created_at': int(time.time()),
+        'id': form_data.id,
+        'model': model.model_dump(mode='json') if model is not None else None,
+        'previous_model_ids': previous_model_ids,
+    }
+    backup_dir = DATA_DIR / 'model-deletions'
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    safe_id = ''.join(c if c.isalnum() or c in '-._' else '_' for c in form_data.id)
+    backup_path = backup_dir / f'{int(time.time())}-{safe_id}.json'
+    backup_path.write_text(json.dumps(backup, indent=2, default=str))
+
+    if previous_model_ids:
+        await Config.upsert({'openai.api_configs': updated_configs})
+        from open_webui.routers.openai import clear_models_cache
+
+        await clear_models_cache(request)
+
+    deleted = False
+    if model is not None:
+        deleted = await Models.delete_model_by_id(form_data.id, db=db)
+        if deleted:
+            await publish_event(
+                request,
+                EVENTS.MODEL_DELETED,
+                actor=user,
+                subject_id=form_data.id,
+                data={
+                    'name': model.name,
+                    'permanent': True,
+                    'removed_from_model_ids': list(previous_model_ids.keys()),
+                },
+            )
+
+    return {
+        'ok': deleted or bool(previous_model_ids),
+        'backup': str(backup_path),
+        'removed_from_model_ids': list(previous_model_ids.keys()),
+    }
 
 
 @router.post('/model/test')

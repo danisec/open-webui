@@ -19,6 +19,7 @@
 		createNewModel,
 		deleteAllModels,
 		deleteModelById,
+		deleteModelPermanentlyById,
 		getAllModels,
 		getModelById,
 		exportModels,
@@ -101,6 +102,8 @@
 	let showResetModal = false;
 	let showDeleteModal = false;
 	let modelToDelete: ModelListItem | null = null;
+	let showDeletePermanentModal = false;
+	let modelToDeletePermanently: ModelListItem | null = null;
 	let savingModelOrder = false;
 	let savingModelsSettings = false;
 	let modelOrderDirty = false;
@@ -564,6 +567,21 @@
 		}
 	};
 
+	const deleteModelPermanentlyHandler = async (model: ModelListItem) => {
+		try {
+			const res = await deleteModelPermanentlyById(localStorage.token, model.id);
+			if (!res?.ok) {
+				toast.error($i18n.t('Failed to delete model'));
+				return;
+			}
+
+			toast.success($i18n.t('Deleted {{name}} permanently', { name: model.name }));
+			await init();
+		} catch (error: any) {
+			toast.error(`${error?.detail ?? error}`);
+		}
+	};
+
 	const hideModelHandler = async (model) => {
 		const updatedModel = {
 			...model,
@@ -764,6 +782,19 @@
 	bind:show={showDeleteModal}
 	onConfirm={async () => {
 		if (modelToDelete) await deleteModelHandler(modelToDelete);
+	}}
+/>
+
+<ConfirmDialog
+	title={$i18n.t('Delete permanently')}
+	message={$i18n.t(
+		'This will remove **{{modelName}}** from its provider connection and delete all saved settings. This cannot be undone.',
+		{ modelName: modelToDeletePermanently?.name }
+	)}
+	confirmLabel={$i18n.t('Delete permanently')}
+	bind:show={showDeletePermanentModal}
+	onConfirm={async () => {
+		if (modelToDeletePermanently) await deleteModelPermanentlyHandler(modelToDeletePermanently);
 	}}
 />
 
@@ -1248,6 +1279,12 @@
 											modelToDelete = model;
 											showDeleteModal = true;
 										}}
+										deletePermanentlyHandler={canResetModel(model)
+											? () => {
+													modelToDeletePermanently = model;
+													showDeletePermanentModal = true;
+												}
+											: null}
 										exportHandler={() => {
 											exportModelHandler(model);
 										}}
