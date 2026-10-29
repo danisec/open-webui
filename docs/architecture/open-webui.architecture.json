@@ -1,0 +1,357 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Arsitektur Open WebUI",
+    "quality_profile": "showcase",
+    "output": "docs/architecture/open-webui-architecture.html"
+  },
+  "components": [
+    {
+      "id": "browser",
+      "type": "external",
+      "label": "Browser",
+      "sublabel": "chat + admin Settings",
+      "pos": [
+        40,
+        340
+      ],
+      "size": [
+        130,
+        62
+      ]
+    },
+    {
+      "id": "tunnel",
+      "type": "cloud",
+      "label": "Cloudflare Tunnel",
+      "sublabel": "9router.socket.my.id",
+      "pos": [
+        210,
+        340
+      ],
+      "size": [
+        150,
+        62
+      ]
+    },
+    {
+      "id": "webui",
+      "type": "backend",
+      "label": "Open WebUI",
+      "sublabel": "FastAPI + SvelteKit :3000",
+      "pos": [
+        400,
+        340
+      ],
+      "size": [
+        160,
+        62
+      ],
+      "tag": "Batam"
+    },
+    {
+      "id": "rotator",
+      "type": "backend",
+      "label": "model-rotator",
+      "sublabel": "alias \u2192 kandidat :8891",
+      "pos": [
+        400,
+        170
+      ],
+      "size": [
+        160,
+        58
+      ],
+      "tag": "Batam"
+    },
+    {
+      "id": "lb",
+      "type": "backend",
+      "label": "9router-lb",
+      "sublabel": "nginx :8899",
+      "pos": [
+        610,
+        340
+      ],
+      "size": [
+        140,
+        62
+      ],
+      "tag": "Batam"
+    },
+    {
+      "id": "router",
+      "type": "cloud",
+      "label": "9router",
+      "sublabel": "k3s NodePort 30128",
+      "pos": [
+        790,
+        340
+      ],
+      "size": [
+        140,
+        62
+      ],
+      "tag": "proxmox"
+    },
+    {
+      "id": "providers",
+      "type": "external",
+      "label": "Provider upstream",
+      "sublabel": "tokeharbour \u00b7 wb2hub \u00b7 carte \u00b7 oc",
+      "pos": [
+        970,
+        340
+      ],
+      "size": [
+        175,
+        62
+      ],
+      "tag": "upstream"
+    },
+    {
+      "id": "db",
+      "type": "database",
+      "label": "webui.db",
+      "sublabel": "SQLite \u00b7 volume podman",
+      "pos": [
+        400,
+        500
+      ],
+      "size": [
+        150,
+        56
+      ],
+      "tag": "Batam"
+    },
+    {
+      "id": "mcp",
+      "type": "security",
+      "label": "MCP Gateway",
+      "sublabel": "tool difilter per role",
+      "pos": [
+        575,
+        500
+      ],
+      "size": [
+        145,
+        56
+      ],
+      "tag": "Batam"
+    },
+    {
+      "id": "terminal",
+      "type": "backend",
+      "label": "Open Terminal",
+      "sublabel": "workspace per user",
+      "pos": [
+        745,
+        500
+      ],
+      "size": [
+        145,
+        56
+      ],
+      "tag": "Batam"
+    },
+    {
+      "id": "jupyter",
+      "type": "backend",
+      "label": "Jupyter",
+      "sublabel": "code interpreter",
+      "pos": [
+        915,
+        500
+      ],
+      "size": [
+        135,
+        56
+      ],
+      "tag": "Batam"
+    },
+    {
+      "id": "lightrag",
+      "type": "database",
+      "label": "LightRAG",
+      "sublabel": "index dokumen :9622",
+      "pos": [
+        1075,
+        500
+      ],
+      "size": [
+        150,
+        56
+      ],
+      "tag": "proxmox"
+    }
+  ],
+  "connections": [
+    {
+      "from": "browser",
+      "to": "tunnel",
+      "label": "HTTPS",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelAt": [
+        190,
+        322
+      ],
+      "route": "straight"
+    },
+    {
+      "from": "tunnel",
+      "to": "webui",
+      "label": "HTTPS",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelAt": [
+        380,
+        322
+      ],
+      "route": "straight"
+    },
+    {
+      "from": "webui",
+      "to": "lb",
+      "label": "model langsung",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelAt": [
+        585,
+        322
+      ],
+      "route": "straight"
+    },
+    {
+      "from": "webui",
+      "to": "rotator",
+      "label": "alias",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "labelAt": [
+        540,
+        260
+      ]
+    },
+    {
+      "from": "rotator",
+      "to": "lb",
+      "label": "alias \u2192 kandidat",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        620,
+        270
+      ]
+    },
+    {
+      "from": "lb",
+      "to": "router",
+      "label": "NodePort 30128",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelAt": [
+        770,
+        322
+      ],
+      "route": "straight"
+    },
+    {
+      "from": "router",
+      "to": "providers",
+      "label": "API provider",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelAt": [
+        950,
+        322
+      ],
+      "route": "straight"
+    },
+    {
+      "from": "webui",
+      "to": "db",
+      "label": "state",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        430,
+        482
+      ]
+    },
+    {
+      "from": "webui",
+      "to": "mcp",
+      "label": "tool call",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        600,
+        482
+      ]
+    },
+    {
+      "from": "webui",
+      "to": "terminal",
+      "label": "upload / shell",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        770,
+        482
+      ]
+    },
+    {
+      "from": "webui",
+      "to": "jupyter",
+      "label": "code",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        940,
+        482
+      ]
+    },
+    {
+      "from": "webui",
+      "to": "lightrag",
+      "label": "RAG",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        1105,
+        482
+      ]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "Jalur model",
+      "items": [
+        "Koneksi 0: model langsung ke 9router-lb",
+        "Koneksi 1: alias lewat model-rotator",
+        "Failover berurutan + cooldown 120 s"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "Layanan AI",
+      "items": [
+        "MCP Gateway: tool difilter per role",
+        "Open Terminal: file chat di workspace user",
+        "LightRAG: index dokumen, admin-only"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Konfigurasi",
+      "items": [
+        "model-groups.json: alias + prioritas",
+        "managed_aliases: sinkron model_ids",
+        "Reconciler berjalan tiap 2 menit"
+      ]
+    }
+  ]
+}

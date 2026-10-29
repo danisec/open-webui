@@ -311,3 +311,10 @@ cypress/videos
 cypress/screenshots
 .vscode/settings.json
 .cptr
+
+# local debug backups
+*.bak.*
+
+# generated architecture artifacts (source: docs/architecture/open-webui.architecture.json)
+docs/architecture/open-webui-architecture.html
+docs/architecture/open-webui-architecture.visual-check.json
