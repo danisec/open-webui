@@ -352,6 +352,28 @@ OPENAI_API_BASE_URLS = [
 ]
 OPENAI_API_BASE_URLS = OPENAI_API_BASE_URLS
 
+# Patterns stripped from the END of model responses. Some providers append their own
+# advertising footer as ordinary text, so it can only be removed by filtering. Kept in
+# config rather than hardcoded so another provider can be added without a code change.
+# See open_webui/utils/response_filters.py for the rules that keep this safe.
+_openai_response_filters = os.getenv('OPENAI_RESPONSE_FILTERS', '')
+OPENAI_RESPONSE_FILTERS: list[str] = []
+if _openai_response_filters:
+    try:
+        _parsed_filters = json.loads(_openai_response_filters)
+        if isinstance(_parsed_filters, list):
+            OPENAI_RESPONSE_FILTERS = [str(p) for p in _parsed_filters if str(p).strip()]
+        else:
+            log.warning('OPENAI_RESPONSE_FILTERS must be a JSON array, ignoring')
+    except json.JSONDecodeError:
+        log.warning('OPENAI_RESPONSE_FILTERS is not valid JSON, ignoring')
+else:
+    # Default: the footer observed from api.howtofix.id. Empty list disables filtering.
+    OPENAI_RESPONSE_FILTERS = [
+        r'\s*\n[ \t]*-{1,}[ \t]*\s*\n[ \t]*Free plan[ \t]*[\u00b7\u2022][ \t]*https?://howtofix\.id[ \t]*$',
+        r'\s*\n[ \t]*Free plan[ \t]*[\u00b7\u2022][ \t]*https?://howtofix\.id[ \t]*$',
+    ]
+
 OPENAI_API_CONFIGS = {}
 _openai_api_configs = os.getenv('OPENAI_API_CONFIGS', '')
 if _openai_api_configs:
@@ -2879,6 +2901,7 @@ DEFAULT_CONFIG = {
     'openai.api_keys': OPENAI_API_KEYS,
     'openai.api_base_urls': OPENAI_API_BASE_URLS,
     'openai.api_configs': OPENAI_API_CONFIGS,
+    'openai.response_filters': OPENAI_RESPONSE_FILTERS,
     'models.base_models_cache': ENABLE_BASE_MODELS_CACHE,
     'tool_server.connections': TOOL_SERVER_CONNECTIONS,
     'oauth.client.timeout': OAUTH_CLIENT_TIMEOUT,

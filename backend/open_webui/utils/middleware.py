@@ -104,6 +104,11 @@ from open_webui.utils.filter import (
 )
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.memory import add_memory_context, review_memory_after_turn
+from open_webui.utils.response_filters import (
+    FooterStreamFilter,
+    compile_patterns,
+    strip_footers,
+)
 from open_webui.utils.misc import (
     add_or_update_system_message,
     add_or_update_user_message,
@@ -4316,6 +4321,27 @@ async def non_streaming_chat_response_handler(response, ctx):
     if response_data is None:
         return response
 
+    # Strip provider-injected attribution footers ONCE, here, before any branch can
+    # read `content`. Every return path below (event emitter, outlet filter,
+    # build_response_object, merge_events_into_response) then sees the same clean text.
+    # An earlier version filtered inside `if event_emitter:` only, so requests without
+    # an emitter -- including /api/chat/completions -- returned the footer untouched.
+    try:
+        _footer_patterns = compile_patterns(await Config.get('openai.response_filters'))
+        if _footer_patterns:
+            for _choice in response_data.get('choices') or []:
+                _msg = _choice.get('message') if isinstance(_choice, dict) else None
+                if not isinstance(_msg, dict):
+                    continue
+                _text = _msg.get('content')
+                if isinstance(_text, str) and _text:
+                    _cleaned = strip_footers(_text, _footer_patterns, source='non-stream')
+                    if _cleaned != _text:
+                        _msg['content'] = _cleaned
+    except Exception as _filter_error:
+        # A cosmetic filter must never break a response.
+        log.warning('response filter skipped (non-stream): %s', _filter_error)
+
     chat_id = metadata.get('chat_id') or ''
     save_to_chat = is_saved_chat_id(chat_id)
     continuing = bool(metadata.get('assistant_message_id'))
@@ -4362,6 +4388,7 @@ async def non_streaming_chat_response_handler(response, ctx):
             choices = response_data.get('choices', [])
             response_output = response_data.get('output')
             content = (choices[0].get('message', {}).get('content') or '') if choices else ''
+
             # Native tools only run on the streaming path; still finish the turn.
             tool_calls = choices[0].get('message', {}).get('tool_calls') if choices else None
 
@@ -4509,6 +4536,33 @@ async def non_streaming_chat_response_handler(response, ctx):
         response = merge_events_into_response(response_data, events)
 
     return response
+
+
+def _frame_payload(frame):
+    """Return (prefix, dict) for a `data: {...}` SSE frame, or (None, None)."""
+    if isinstance(frame, bytes):
+        try:
+            text = frame.decode('utf-8')
+        except UnicodeDecodeError:
+            return None, None
+    elif isinstance(frame, str):
+        text = frame
+    else:
+        return None, None
+
+    stripped = text.strip()
+    if not stripped.startswith('data:'):
+        return None, None
+    payload = stripped[len('data:') :].strip()
+    if not payload or payload == '[DONE]':
+        return None, None
+    try:
+        parsed = JSONCodec.loads(payload)
+    except Exception:
+        return None, None
+    if not isinstance(parsed, dict):
+        return None, None
+    return text, parsed
 
 
 async def streaming_chat_response_handler(response, ctx):
@@ -6725,6 +6779,72 @@ async def streaming_chat_response_handler(response, ctx):
                         },
                     )
 
+                # Strip provider footers from the COMPLETE text, once, here.
+                #
+                # Streaming-level filtering is not viable for this provider: it emits
+                # 1-2 character deltas (measured: min=1, avg=1.2), so catching a
+                # 44-character footer mid-stream would require withholding most of the
+                # reply. Doing it at the end means the database, the title, the usage
+                # and the client all see the cleaned text, and nothing can be lost
+                # because nothing is withheld.
+                #
+                # IMPORTANT: the final text has two possible sources. `content_parts`
+                # is used for chat-completions style streams; `current_output` carries
+                # the Responses-API shaped output. The save site itself uses
+                # `''.join(content_parts) or get_output_text(current_output)`, so both
+                # must be cleaned -- an earlier version only handled the first, which is
+                # empty on the live path, so the footer survived silently.
+                try:
+                    _footer_patterns = compile_patterns(await Config.get('openai.response_filters'))
+                    # Diagnostic: which source holds the text, and how much. Once per
+                    # stream, so it is cheap and safe to leave in.
+                    log.info(
+                        'footer filter (stream end): patterns=%d content_parts=%d(%d chars) output_text=%d chars',
+                        len(_footer_patterns),
+                        len(content_parts),
+                        len(''.join(content_parts)),
+                        len(get_output_text(current_output)),
+                    )
+                    if _footer_patterns:
+                        _cleaned_text = None
+
+                        _joined = ''.join(content_parts)
+                        if _joined:
+                            _stripped = strip_footers(_joined, _footer_patterns, source='stream-end')
+                            if _stripped != _joined:
+                                content_parts[:] = [_stripped]
+                                _cleaned_text = _stripped
+
+                        _from_output = get_output_text(current_output)
+                        if _from_output:
+                            _stripped_output = strip_footers(_from_output, _footer_patterns, source='stream-end-output')
+                            if _stripped_output != _from_output:
+                                # Rewrite the text parts in place so every consumer of
+                                # `current_output` sees the cleaned version.
+                                for _item in current_output or []:
+                                    if not isinstance(_item, dict) or _item.get('type') != 'message':
+                                        continue
+                                    for _part in _item.get('content') or []:
+                                        if not isinstance(_part, dict):
+                                            continue
+                                        _text = _part.get('text')
+                                        if isinstance(_text, str) and _text:
+                                            _part['text'] = strip_footers(
+                                                _text,
+                                                _footer_patterns,
+                                                source='stream-end-part',
+                                            )
+                                if _cleaned_text is None:
+                                    _cleaned_text = _stripped_output
+
+                        if _cleaned_text is not None:
+                            # Ask the client to REPLACE what it rendered so the footer
+                            # disappears from view. Chat.svelte handles 'chat:message'
+                            # by assigning message.content instead of appending.
+                            await event_emitter({'type': 'chat:message', 'data': {'content': _cleaned_text}})
+                except Exception as _filter_error:
+                    log.warning('response filter skipped at stream end: %s', _filter_error)
+
                 await clear_response_stream(request.app.state.redis, response_stream_task_id)
                 await publish_chat_finished_event(
                     request,
@@ -6811,10 +6931,17 @@ async def streaming_chat_response_handler(response, ctx):
             def wrap_item(item):
                 return f'data: {item}\n\n'
 
+            # Accumulate the streamed content so the footer can be stripped at the end
+            # of THIS branch too. Requests without a saved chat (direct API calls,
+            # opencode) have no event_emitter and land here, so filtering only inside
+            # `response_handler` would never run for them.
+            _streamed_text = []
+
             try:
                 message = {}
                 outlet_task = None
                 filter_context = FilterContext()
+
                 outlet_enabled = ENABLE_API_OUTLET_FILTERS and bool(filter_functions)
                 if ENABLE_API_OUTLET_FILTERS and not outlet_enabled:
                     try:
@@ -6862,6 +6989,16 @@ async def streaming_chat_response_handler(response, ctx):
                                     data = wrap_item(JSONCodec.dumps(event)) if event else None
 
                     if data:
+                        try:
+                            _txt, _parsed = _frame_payload(data)
+                            if _parsed is not None:
+                                _delta = (_parsed.get('choices') or [{}])[0].get('delta') or {}
+                                _c = _delta.get('content')
+                                if isinstance(_c, str) and _c:
+                                    _streamed_text.append(_c)
+                        except Exception:
+                            pass
+
                         if outlet_enabled:
                             done = update_assistant_message_from_stream(message, data)
                             if done and message and outlet_task is None:
@@ -6869,6 +7006,18 @@ async def streaming_chat_response_handler(response, ctx):
                                 # Start before yielding [DONE], which may trigger a disconnect.
                                 outlet_task = asyncio.create_task(outlet_filter_handler(ctx))
                         yield data
+
+                # Strip the footer from the complete text of this branch, then send a
+                # replace frame so the client drops what it already rendered.
+                try:
+                    _patterns = compile_patterns(await Config.get('openai.response_filters'))
+                    if _patterns and _streamed_text:
+                        _full = ''.join(_streamed_text)
+                        _clean = strip_footers(_full, _patterns, source='stream-fallback')
+                        if _clean != _full:
+                            yield f'data: {JSONCodec.dumps({"type": "chat:message", "data": {"content": _clean}})}\n\n'
+                except Exception as _e:
+                    log.warning('response filter skipped (stream fallback): %s', _e)
 
                 if outlet_task is not None:
                     await asyncio.shield(outlet_task)
