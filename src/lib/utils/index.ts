@@ -2507,3 +2507,81 @@ export const displayFileHandler = (
 		stores.showFileNavPath.set(page ? { path, page } : path);
 	}
 };
+
+/**
+ * Group TTS chunks into "chapters" long enough to be worth picking from a list.
+ *
+ * Per-sentence chunks are ideal for streaming latency but useless as a
+ * navigation list: a long answer yields dozens of entries of a few seconds
+ * each. Chapters merge consecutive chunks up to a target spoken length so the
+ * list stays short and each entry plays for a meaningful stretch.
+ *
+ * Duration is estimated from word count (~2.7 words/second for this voice),
+ * because the audio does not exist until each chunk is synthesised. The
+ * estimate is only used for labels and grouping, never for playback control.
+ */
+export type TtsChapter = {
+	/** Chunk indexes (into the original parts array) covered by this chapter. */
+	partIndexes: number[];
+	/** First ~80 chars, for the list label. */
+	preview: string;
+	/** Estimated spoken duration in seconds. */
+	seconds: number;
+	wordCount: number;
+};
+
+const TTS_WORDS_PER_SECOND = 2.7;
+
+export const estimateSpeechSeconds = (text: string): number => {
+	const words = (text.match(/\S+/g) ?? []).length;
+	if (!words) return 0;
+	// Fixed cost per request (model warmup, encoder pass) dominates short
+	// chunks, so a plain words/rate division under-reports them badly.
+	return words / TTS_WORDS_PER_SECOND + 0.4;
+};
+
+export const formatSpeechDuration = (seconds: number): string => {
+	const total = Math.max(0, Math.round(seconds));
+	const m = Math.floor(total / 60);
+	const s = total % 60;
+	return `${m}:${String(s).padStart(2, '0')}`;
+};
+
+export const buildTtsChapters = (parts: string[], targetSeconds: number = 25): TtsChapter[] => {
+	const chapters: TtsChapter[] = [];
+	let current: { indexes: number[]; texts: string[]; seconds: number; words: number } | null = null;
+
+	const flush = () => {
+		if (!current || !current.indexes.length) return;
+		const joined = current.texts.join(' ').trim();
+		chapters.push({
+			partIndexes: current.indexes,
+			preview: joined.slice(0, 80),
+			seconds: current.seconds,
+			wordCount: current.words
+		});
+		current = null;
+	};
+
+	for (let i = 0; i < parts.length; i++) {
+		const text = parts[i];
+		if (!text?.trim()) continue;
+		const secs = estimateSpeechSeconds(text);
+		const words = (text.match(/\S+/g) ?? []).length;
+
+		if (!current) {
+			current = { indexes: [i], texts: [text], seconds: secs, words };
+		} else {
+			current.indexes.push(i);
+			current.texts.push(text);
+			current.seconds += secs;
+			current.words += words;
+		}
+
+		// Close the chapter once it is long enough, so the next one starts fresh.
+		if (current.seconds >= targetSeconds) flush();
+	}
+	flush();
+
+	return chapters;
+};

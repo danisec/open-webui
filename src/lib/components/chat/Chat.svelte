@@ -2346,11 +2346,17 @@
 		const nextContentParts = (final ? messageContentParts : messageContentParts.slice(0, -1)).slice(
 			sentContentPartCount
 		);
+		// Voice mode should speak as soon as a fragment is intelligible. The
+		// old 4-word / 50-character floor held short replies ("Ya, tentu.")
+		// until the whole response had finished streaming, which is exactly
+		// the shape a spoken answer usually takes. Voice mode now only needs
+		// one word and 12 characters, so punctuation debris is still held
+		// back but a real sentence is spoken immediately.
 		const pendingContentPartIndex = nextContentParts.findIndex(
 			(content) =>
 				!final &&
 				ttsSplitOn === 'punctuation' &&
-				(content.split(/\s+/).length < 4 || content.length < 50)
+				(content.trim().split(/\s+/).filter(Boolean).length < 1 || content.trim().length < 12)
 		);
 		const dispatchContentParts =
 			pendingContentPartIndex === -1
@@ -3327,6 +3333,18 @@
 			if (message.error) {
 				dismissContextCompactionToast();
 				bridge?.update();
+				// The call overlay waits for `chat:finish` to stop speaking and
+				// to re-open the microphone. Returning without it left
+				// `assistantSpeaking` true forever, so a single failed response
+				// silenced voice mode until the call was closed.
+				eventTarget.dispatchEvent(
+					new CustomEvent('chat:finish', {
+						detail: {
+							id: message.id,
+							content: getOutputText(message?.output) || removeAllDetails(message?.content ?? '')
+						}
+					})
+				);
 				await processNextInQueue(chatId);
 				return;
 			}

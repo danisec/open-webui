@@ -25,12 +25,14 @@
 		TTSWorker,
 		user
 	} from '$lib/stores';
-	import { synthesizeOpenAISpeech } from '$lib/apis/audio';
+	import { synthesizeOpenAISpeech, getTtsHealth } from '$lib/apis/audio';
 	import { imageGenerations } from '$lib/apis/images';
 	import {
 		copyToClipboard as _copyToClipboard,
 		approximateToHumanReadable,
 		getMessageContentParts,
+		buildTtsChapters,
+		formatSpeechDuration,
 		sanitizeResponseContent,
 		createMessagesList,
 		formatMessageTimestamp,
@@ -38,6 +40,7 @@
 		removeDetails,
 		removeAllDetails
 	} from '$lib/utils';
+	import type { TtsChapter } from '$lib/utils';
 	import { WEBUI_API_BASE_URL, WEBUI_BASE_URL } from '$lib/constants';
 	import { resolveLocalizedModelName } from '$lib/utils/localizedContent';
 	import equal from 'fast-deep-equal';
@@ -210,7 +213,36 @@
 	let speakingIdx: number | undefined;
 
 	let loadingSpeech = false;
+
+	// TTS availability. A dead upstream used to surface only after the user clicked
+	// Speak and waited, as two vague toasts. Checking once up front turns that into a
+	// disabled button with the actual reason.
+	let ttsAvailable: boolean | null = null;
+	let ttsDetail: string | null = null;
+	let ttsChecked = false;
+
+	const checkTts = async () => {
+		if (ttsChecked) return;
+		ttsChecked = true;
+		try {
+			const health = await getTtsHealth(localStorage.token);
+			ttsAvailable = health?.available ?? null;
+			ttsDetail = health?.detail ?? null;
+		} catch {
+			ttsAvailable = null;
+		}
+	};
+
+	$: if (message?.done && ttsAvailable === null) {
+		checkTts();
+	}
 	let speakAbort: AbortController | null = null;
+
+	// Chapter picker: one entry per ~25s of speech instead of one per sentence,
+	// so a long answer stays navigable.
+	let showChapters = false;
+	let chapters: TtsChapter[] = [];
+	let activeChapter = -1;
 
 	let showRateComment = false;
 
@@ -253,6 +285,43 @@
 		speaking = false;
 		speakingIdx = undefined;
 		loadingSpeech = false;
+		activeChapter = -1;
+	};
+
+	/**
+	 * Open the chapter list, building it on first use.
+	 *
+	 * Chapters are derived from the same parts the player uses, so an entry's
+	 * index maps straight onto a chunk range — no re-parsing or drift between
+	 * what the list shows and what actually plays.
+	 */
+	const toggleChapters = () => {
+		if (showChapters) {
+			showChapters = false;
+			return;
+		}
+
+		const content = visibleResponseContent;
+		if (!content.trim().length) {
+			toast.info($i18n.t('No content to speak'));
+			return;
+		}
+
+		const parts = getMessageContentParts(content, $config?.audio?.tts?.split_on ?? 'punctuation');
+		chapters = buildTtsChapters(parts);
+		showChapters = chapters.length > 0;
+	};
+
+	const speakChapter = (index: number) => {
+		const chapter = chapters[index];
+		if (!chapter) return;
+
+		// Play from this chapter to the end of the message. Stopping at the
+		// chapter boundary meant picking chapter 2 silently ended after ~25s,
+		// which reads as a bug rather than a feature. Jump-to-start is the point;
+		// a truncated run is not.
+		const from = chapter.partIndexes[0];
+		speak({ fromPart: from, chapterIndex: index });
 	};
 
 	// Resolve voice: model-specific > user settings > config default
@@ -262,7 +331,7 @@
 			? ($settings?.audio?.tts?.voice ?? $config?.audio?.tts?.voice)
 			: $config?.audio?.tts?.voice);
 
-	const speak = async () => {
+	const speak = async (range?: { fromPart: number; toPart?: number; chapterIndex?: number }) => {
 		const content = visibleResponseContent;
 		if (!content.trim().length) {
 			toast.info($i18n.t('No content to speak'));
@@ -273,6 +342,7 @@
 		speakAbort = new AbortController();
 		const { signal } = speakAbort;
 
+		activeChapter = range?.chapterIndex ?? -1;
 		speaking = true;
 
 		if ($config.audio.tts.engine === '') {
@@ -306,18 +376,42 @@
 			$audioQueue.onStopped = ({ event }) => {
 				speaking = false;
 				speakingIdx = undefined;
+				activeChapter = -1;
 
 				if (event === 'error') {
 					speakAbort?.abort();
-					toast.error($i18n.t('Audio playback failed'));
+					// Prefer the real reason: the upstream being down is the usual cause, and
+					// the generic message sends people looking in the wrong place.
+					if (ttsAvailable === false && ttsDetail) {
+						toast.error(`${$i18n.t('Text-to-speech is unavailable')}: ${ttsDetail}`);
+					} else {
+						toast.error($i18n.t('Audio playback failed'));
+					}
 				}
 			};
 
+			// Highlight the chapter currently being spoken. Playback now runs past
+			// the selected chapter to the end of the message, so the marker has to
+			// follow it instead of staying on whatever was clicked.
+			$audioQueue.onChunkStarted = (position: number) => {
+				const absolute = (range?.fromPart ?? 0) + position;
+				if (!chapters.length) return;
+				const idx = chapters.findIndex((c) => c.partIndexes.includes(absolute));
+				if (idx !== -1) activeChapter = idx;
+			};
+
 			loadingSpeech = true;
-			const messageContentParts: string[] = getMessageContentParts(
+			const allParts: string[] = getMessageContentParts(
 				content,
 				$config?.audio?.tts?.split_on ?? 'punctuation'
 			);
+
+			// A chapter request plays only its own slice, so picking entry 3 does
+			// not re-synthesise (or replay) entries 1 and 2.
+			const messageContentParts =
+				range && Number.isInteger(range.fromPart)
+					? allParts.slice(range.fromPart, range.toPart ?? allParts.length)
+					: allParts;
 
 			if (!messageContentParts.length) {
 				toast.info($i18n.t('No content to speak'));
@@ -367,9 +461,11 @@
 				$audioQueue?.markProducerDone();
 				loadingSpeech = false;
 			} else {
-				// Pre-synthesize the whole message before playback: the player then has
-				// every chunk up front and never runs dry mid-message.
-				const urls: string[] = [];
+				// Stream chunks into the queue as they finish instead of buffering
+				// the whole message first. AudioQueue already holds playback until
+				// minBuffer chunks are ready and resumes if it ever runs dry, so
+				// speech starts after the first chunks rather than after the last.
+				let enqueued = 0;
 				for (const [, sentence] of messageContentParts.entries()) {
 					if (signal.aborted) break;
 
@@ -379,7 +475,18 @@
 						if (!res) continue;
 
 						const blob = await res.blob();
-						if (blob.size) urls.push(URL.createObjectURL(blob));
+						if (!blob.size) continue;
+
+						// A chunk that arrives after cancellation must not be queued,
+						// and its object URL has to be released or it leaks.
+						const url = URL.createObjectURL(blob);
+						if (signal.aborted) {
+							URL.revokeObjectURL(url);
+							break;
+						}
+
+						$audioQueue.enqueue(url);
+						enqueued++;
 					} catch (error) {
 						// Skip this chunk and keep going: one failed sentence must not
 						// stop the rest of the message from being spoken.
@@ -389,14 +496,13 @@
 
 				if (signal.aborted) return;
 
-				if (urls.length === 0) {
+				if (enqueued === 0) {
 					toast.error($i18n.t('Audio playback failed'));
 					speaking = false;
 					loadingSpeech = false;
 					return;
 				}
 
-				for (const url of urls) $audioQueue.enqueue(url);
 				$audioQueue?.markProducerDone();
 				loadingSpeech = false;
 			}
@@ -1157,13 +1263,24 @@
 								</Tooltip>
 
 								{#if !readOnly && ($user?.role === 'admin' || ($user?.permissions?.chat?.tts ?? true))}
-									<Tooltip content={$i18n.t('Read Aloud')} placement="bottom">
+									<Tooltip
+										content={ttsAvailable === false
+											? $i18n.t('Text-to-speech is unavailable') +
+												(ttsDetail ? `: ${ttsDetail}` : '')
+											: $i18n.t('Read Aloud')}
+										placement="bottom"
+									>
 										<button
 											aria-label={$i18n.t('Read Aloud')}
+											disabled={ttsAvailable === false}
+											title={ttsAvailable === false ? (ttsDetail ?? undefined) : undefined}
 											id="speak-button-{message.id}"
 											class="{isLastMessage || ($settings?.highContrastMode ?? false)
 												? 'visible'
-												: 'hover-reveal'} p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition"
+												: 'hover-reveal'} p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition {ttsAvailable ===
+											false
+												? 'opacity-40 cursor-not-allowed'
+												: ''}"
 											on:click={() => {
 												if (loadingSpeech || speaking) {
 													stopAudio();
@@ -1238,6 +1355,37 @@
 													/>
 												</svg>
 											{/if}
+										</button>
+									</Tooltip>
+								{/if}
+
+								{#if !readOnly && ($user?.role === 'admin' || ($user?.permissions?.chat?.tts ?? true))}
+									<Tooltip content={$i18n.t('Play from chapter')} placement="bottom">
+										<button
+											aria-label={$i18n.t('Play from chapter')}
+											id="chapters-button-{message.id}"
+											class="{isLastMessage || ($settings?.highContrastMode ?? false)
+												? 'visible'
+												: 'hover-reveal'} {showChapters
+												? 'bg-black/5 dark:bg-white/10'
+												: ''} p-1.5 hover:bg-black/5 dark:hover:bg-white/5 rounded-lg dark:hover:text-white hover:text-black transition"
+											on:click={toggleChapters}
+										>
+											<svg
+												xmlns="http://www.w3.org/2000/svg"
+												fill="none"
+												viewBox="0 0 24 24"
+												stroke-width="2.3"
+												stroke="currentColor"
+												class="w-4 h-4"
+												aria-hidden="true"
+											>
+												<path
+													stroke-linecap="round"
+													stroke-linejoin="round"
+													d="M8.25 6.75h12M8.25 12h12m-12 5.25h12M3.75 6.75h.007v.008H3.75V6.75zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zM3.75 12h.007v.008H3.75V12zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm-.375 5.25h.007v.008H3.75v-.008zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z"
+												/>
+											</svg>
 										</button>
 									</Tooltip>
 								{/if}
@@ -1682,6 +1830,55 @@
 									}
 								}}
 							/>
+							{#if showChapters && chapters.length > 0}
+								<div
+									class="mt-2 w-full rounded-xl border border-gray-100 dark:border-gray-850 bg-gray-50/60 dark:bg-gray-900/40 p-2 max-h-72 overflow-y-auto"
+									role="group"
+									aria-label={$i18n.t('Play from chapter')}
+								>
+									<button
+										class="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-left text-sm font-medium hover:bg-black/5 dark:hover:bg-white/5 transition"
+										on:click={() => speak()}
+									>
+										<svg
+											xmlns="http://www.w3.org/2000/svg"
+											fill="currentColor"
+											viewBox="0 0 24 24"
+											class="w-4 h-4 shrink-0"
+											aria-hidden="true"
+										>
+											<path d="M8 5v14l11-7z" />
+										</svg>
+										<span>{$i18n.t('Play all')}</span>
+										<span class="ml-auto text-xs text-gray-500 dark:text-gray-400 tabular-nums">
+											{formatSpeechDuration(chapters.reduce((s, c) => s + c.seconds, 0))}
+										</span>
+									</button>
+									{#each chapters as chapter, i (i)}
+										<button
+											class="w-full flex items-start gap-2 px-2 py-1.5 rounded-lg text-left text-sm transition {activeChapter ===
+											i
+												? 'bg-black/5 dark:bg-white/10'
+												: 'hover:bg-black/5 dark:hover:bg-white/5'}"
+											on:click={() => speakChapter(i)}
+											title={chapter.preview}
+										>
+											<span
+												class="shrink-0 w-4 text-xs text-gray-400 dark:text-gray-500 tabular-nums mt-0.5"
+												>{i + 1}</span
+											>
+											<span class="flex-1 min-w-0 truncate text-gray-700 dark:text-gray-300"
+												>{chapter.preview}</span
+											>
+											<span
+												class="shrink-0 text-xs text-gray-500 dark:text-gray-400 tabular-nums mt-0.5"
+											>
+												{formatSpeechDuration(chapter.seconds)}
+											</span>
+										</button>
+									{/each}
+								</div>
+							{/if}
 						</div>
 					{/if}
 				{/if}

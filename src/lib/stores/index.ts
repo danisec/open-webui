@@ -240,6 +240,12 @@ type Settings = {
 	showChangelog?: boolean;
 	showEmojiInCall?: boolean;
 	voiceInterruption?: boolean;
+	// Voice activity detection tuning; unset falls back to the defaults in
+	// CallOverlay.svelte.
+	voiceThresholdDb?: number;
+	voiceMinSpeechMs?: number;
+	voiceSilenceMs?: number;
+	voiceMaxUtteranceMs?: number;
 	collapseCodeBlocks?: boolean;
 	expandDetails?: boolean;
 	notificationSound?: boolean;
