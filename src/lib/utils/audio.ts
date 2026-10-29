@@ -22,11 +22,26 @@ export class AudioQueue {
 
 	id: string | null = null;
 	onStopped: OnStoppedCallback | null = null;
+	/** Called with the queue position (0-based) each time a chunk starts playing. */
+	onChunkStarted: ((position: number) => void) | null = null;
+	/** How many chunks have been played out of this queue so far. */
+	private playedCount = 0;
 
-	/** Chunks buffered before playback starts, so a slow producer cannot starve the player. */
-	minBuffer = 2;
-	/** How long to wait for the next chunk before giving up (ms). */
-	maxWait = 45000;
+	/**
+	 * Chunks buffered before playback starts, so a slow producer cannot starve the player.
+	 * 1 is safe here because synthesis runs ~3x faster than playback (RTF ~0.3):
+	 * a 41-char sentence yields 3.13s of audio in 1.54s, so the buffer refills
+	 * well before the first chunk finishes playing. Waiting for 2 chunks would
+	 * add ~1.6s to time-to-first-audio for no robustness gain.
+	 */
+	minBuffer = 1;
+	/**
+	 * How long to wait for the next chunk before giving up (ms).
+	 * Chunks are now streamed in as they are synthesized, so a stalled producer
+	 * shows up as silence mid-sentence. 15s is long enough to ride out a slow
+	 * synthesis call and short enough that the user is not left hanging.
+	 */
+	maxWait = 15000;
 
 	constructor(audioElement: HTMLAudioElement) {
 		this.audio = audioElement;
@@ -119,6 +134,14 @@ export class AudioQueue {
 			const url = this.current;
 			this.audio.src = url;
 			this.audio.muted = false;
+			// Report position so callers can follow along (e.g. highlight the
+			// chapter being spoken while playback runs past the clicked one).
+			const position = this.playedCount++;
+			try {
+				this.onChunkStarted?.(position);
+			} catch {
+				// A listener must never break playback.
+			}
 			this.audio.play().catch((error) => {
 				if (this.current !== url) return;
 
@@ -197,6 +220,7 @@ export class AudioQueue {
 		this.#clearWaitTimer();
 		this.waiting = false;
 		this.producerDone = false;
+		this.playedCount = 0;
 
 		this.audio.pause();
 		this.audio.currentTime = 0;

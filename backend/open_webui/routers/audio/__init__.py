@@ -8,6 +8,8 @@ import io
 import logging
 import mimetypes
 import os
+import threading
+import time
 import uuid
 import wave
 from fnmatch import fnmatch
@@ -34,6 +36,8 @@ from open_webui.config import (
     ELEVENLABS_API_BASE_URL,
     WHISPER_COMPUTE_TYPE,
     WHISPER_LANGUAGE,
+    WHISPER_LANGUAGE_FALLBACK,
+    WHISPER_LANGUAGE_RETRY_LOGPROB,
     WHISPER_MODEL_AUTO_UPDATE,
     WHISPER_MODEL_DIR,
     WHISPER_MULTILINGUAL,
@@ -82,6 +86,68 @@ AZURE_MAX_FILE_SIZE: int = AZURE_MAX_FILE_SIZE_MB * 1024 * 1024
 SPEECH_CACHE_DIR = CACHE_DIR / 'audio' / 'speech'
 SPEECH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def _canonical(value):
+    """Recursively order mappings so equal data always serialises identically.
+
+    JSONCodec (orjson/stdlib) preserves insertion order, so two dicts holding
+    the same data can produce different bytes. The speech cache key is a hash of
+    those bytes, so ordering has to be normalised first or identical requests
+    miss the cache.
+    """
+    if isinstance(value, dict):
+        return {str(k): _canonical(value[k]) for k in sorted(value, key=str)}
+    if isinstance(value, (list, tuple)):
+        return [_canonical(v) for v in value]
+    return value
+
+
+# Round-robin cursor for TTS upstreams. Kubernetes NodePort in this cluster is
+# iptables-based and does not spread low-volume traffic evenly: a single client
+# hitting one node sent 97% of requests to one pod while the other two idled.
+# Rotating the base URL across all nodes makes the fan-out explicit.
+_tts_rr_index = 0
+_tts_rr_lock = threading.Lock()
+
+
+def _split_base_urls(raw) -> list[str]:
+    """Accept one URL or a comma-separated list, normalised and de-duplicated."""
+    if not isinstance(raw, str):
+        return []
+    seen = []
+    for part in raw.split(','):
+        url = part.strip().rstrip('/')
+        if url and url not in seen:
+            seen.append(url)
+    return seen
+
+
+async def _next_tts_base_url() -> str:
+    """Next TTS base URL, rotating when several are configured."""
+    global _tts_rr_index
+
+    urls = _split_base_urls(await Config.get('audio.tts.openai.api_base_url'))
+    if not urls:
+        return ''
+    if len(urls) == 1:
+        return urls[0]
+
+    with _tts_rr_lock:
+        url = urls[_tts_rr_index % len(urls)]
+        _tts_rr_index = (_tts_rr_index + 1) % len(urls)
+    return url
+
+
+async def _tts_base_url_candidates() -> list[str]:
+    """Base URLs to try in order for one request, starting at the RR cursor."""
+    urls = _split_base_urls(await Config.get('audio.tts.openai.api_base_url'))
+    if len(urls) <= 1:
+        return urls
+    first = await _next_tts_base_url()
+    rest = [u for u in urls if u != first]
+    return [first] + rest
+
+
 TTS_CONFIG_KEYS = {
     'OPENAI_API_BASE_URL': 'audio.tts.openai.api_base_url',
     'OPENAI_API_KEY': 'audio.tts.openai.api_key',
@@ -92,6 +158,8 @@ TTS_CONFIG_KEYS = {
     'VOICE': 'audio.tts.voice',
     'REALTIME_TTS_PROMPT_TEMPLATE': 'audio.tts.realtime.prompt_template',
     'SPLIT_ON': 'audio.tts.split_on',
+    'CACHE_MAX_AGE_DAYS': 'audio.tts.cache_max_age_days',
+    'CACHE_MAX_SIZE_MB': 'audio.tts.cache_max_size_mb',
     'AZURE_SPEECH_REGION': 'audio.tts.azure.speech_region',
     'AZURE_SPEECH_BASE_URL': 'audio.tts.azure.speech_base_url',
     'AZURE_SPEECH_OUTPUT_FORMAT': 'audio.tts.azure.speech_output_format',
@@ -254,6 +322,25 @@ def set_faster_whisper_model(model: str, auto_update: bool = False):
     return whisper_model
 
 
+# Guards lazy model construction so the startup warmup and a concurrent first
+# transcription cannot each load a full copy of the model into memory.
+_faster_whisper_model_lock = asyncio.Lock()
+
+
+async def ensure_faster_whisper_model(app):
+    """Return the shared local Whisper model, loading it once on first use."""
+    if app.state.faster_whisper_model is not None:
+        return app.state.faster_whisper_model
+
+    async with _faster_whisper_model_lock:
+        # Another task may have finished loading while we waited on the lock.
+        if app.state.faster_whisper_model is None:
+            app.state.faster_whisper_model = await asyncio.to_thread(
+                set_faster_whisper_model, await Config.get('audio.stt.whisper_model')
+            )
+    return app.state.faster_whisper_model
+
+
 class TTSConfigForm(BaseModel):
     OPENAI_API_BASE_URL: str
     OPENAI_API_KEY: str
@@ -264,6 +351,8 @@ class TTSConfigForm(BaseModel):
     VOICE: str
     REALTIME_TTS_PROMPT_TEMPLATE: Optional[str] = None
     SPLIT_ON: str
+    CACHE_MAX_AGE_DAYS: int = 14
+    CACHE_MAX_SIZE_MB: int = 500
     AZURE_SPEECH_REGION: str
     AZURE_SPEECH_BASE_URL: str
     AZURE_SPEECH_OUTPUT_FORMAT: str
@@ -435,7 +524,6 @@ async def _tts_openai(request, payload, file_path, file_body_path, user):
         payload['voice'] = await Config.get('audio.tts.voice')
     payload = {**payload, **(await Config.get('audio.tts.openai.params') or {})}
     api_key = await Config.get('audio.tts.openai.api_key')
-    api_base_url = await Config.get('audio.tts.openai.api_base_url')
 
     headers = {
         'Content-Type': 'application/json',
@@ -445,34 +533,44 @@ async def _tts_openai(request, payload, file_path, file_body_path, user):
         headers = include_user_info_headers(headers, user)
 
     r = None
-    try:
-        session = await get_session()
-        r = await session.post(
-            url=f'{api_base_url}/audio/speech',
-            json=payload,
-            headers=headers,
-            ssl=AIOHTTP_CLIENT_SESSION_SSL,
-        )
-        r.raise_for_status()
+    last_exc = None
+    # Try each configured upstream once, starting at the round-robin cursor, so
+    # one dead node degrades to a slower request instead of a hard failure.
+    for candidate in await _tts_base_url_candidates():
+        try:
+            session = await get_session()
+            r = await session.post(
+                url=f'{candidate}/audio/speech',
+                json=payload,
+                headers=headers,
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
+            )
+            r.raise_for_status()
 
-        audio_data = await r.read()
-        content_type = r.headers.get('Content-Type', 'audio/mpeg')
+            audio_data = await r.read()
+            content_type = r.headers.get('Content-Type', 'audio/mpeg')
 
-        if USE_SLIM:
-            await _write_tts_cache(file_path, audio_data, file_body_path, payload, content_type)
-            return FileResponse(file_path, media_type=content_type)
+            if USE_SLIM:
+                await _write_tts_cache(file_path, audio_data, file_body_path, payload, content_type)
+                return FileResponse(file_path, media_type=content_type)
 
-        if not await asyncio.to_thread(transcode_audio_to_mp3, audio_data, content_type, file_path):
-            async with aiofiles.open(file_path, 'wb') as f:
-                await f.write(audio_data)
+            if not await asyncio.to_thread(transcode_audio_to_mp3, audio_data, content_type, file_path):
+                async with aiofiles.open(file_path, 'wb') as f:
+                    await f.write(audio_data)
 
-        async with aiofiles.open(file_body_path, 'w') as f:
-            await f.write(JSONCodec.dumps(payload))
+            async with aiofiles.open(file_body_path, 'w') as f:
+                await f.write(JSONCodec.dumps(payload))
 
-        return FileResponse(file_path)
-    except Exception as exc:
-        log.exception(exc)
-        await _raise_tts_error(exc, r)
+            return FileResponse(file_path)
+        except Exception as exc:
+            last_exc = exc
+            log.warning('TTS upstream %s failed: %s', candidate, type(exc).__name__)
+            r = None
+            continue
+
+    if last_exc is not None:
+        log.exception(last_exc)
+    await _raise_tts_error(last_exc, r)
 
 
 async def _tts_openai_realtime(request, payload, file_path, file_body_path, user):
@@ -806,12 +904,30 @@ async def speech(request: Request, user=Depends(get_verified_user)):
         )
         name = hashlib.sha256(JSONCodec.dumps({'engine': engine, **payload}).encode('utf-8')).hexdigest()
     else:
-        name = hashlib.sha256(
-            body
-            + str(engine).encode('utf-8')
-            + str(await Config.get('audio.tts.model')).encode('utf-8')
-            + (b':slim' if USE_SLIM else b'')
-        ).hexdigest()
+        # Cache key must depend only on what actually changes the audio, not on
+        # the exact bytes the client sent. Hashing the raw body made every click
+        # of Read Aloud a cache miss: key order, whitespace, or an optional field
+        # appearing/disappearing all produced a different digest for identical
+        # speech. Parsing and re-serialising deterministically fixes that.
+        try:
+            parsed_body = JSONCodec.loads(body) if body else {}
+        except Exception:
+            parsed_body = {}
+        if not isinstance(parsed_body, dict):
+            parsed_body = {}
+
+        # Only the fields that reach the upstream change the rendered audio.
+        # `response_format`/provider params come from config, so they are folded
+        # in below rather than trusted from the request.
+        key_material = {
+            'input': parsed_body.get('input', ''),
+            'voice': parsed_body.get('voice', '') or str(await Config.get('audio.tts.voice') or ''),
+            'model': str(await Config.get('audio.tts.model') or ''),
+            'params': await Config.get('audio.tts.openai.params') or {},
+            'engine': str(engine),
+            'slim': bool(USE_SLIM),
+        }
+        name = hashlib.sha256(JSONCodec.dumps(_canonical(key_material)).encode('utf-8')).hexdigest()
 
     extension = 'wav' if engine == 'openai-realtime' else 'mp3'
     file_path = SPEECH_CACHE_DIR.joinpath(f'{name}.{extension}')
@@ -859,26 +975,116 @@ async def speech(request: Request, user=Depends(get_verified_user)):
     return response
 
 
+def _decode_whisper(model, file_path, language):
+    """Decode once and return (text, avg_logprob, detected_language, probability).
+
+    avg_logprob is the mean per-token log probability. A decode that is fighting
+    the audio (wrong language forced onto it) lands well below the confidence of
+    a decode that agrees with the audio, which is what makes it a usable signal
+    for choosing between two language hypotheses.
+
+    TEMPERATURE FALLBACK IS DISABLED ON PURPOSE.
+    faster-whisper re-decodes a window at rising temperatures (0.2, 0.4, ... 1.0)
+    when its quality heuristics reject the first attempt. Each retry is a full
+    decode, so one window can cost several times the normal time and the caller
+    cannot see why. Measured on this deployment, 22s of audio with a 2-core CPU:
+
+        multilingual=False (old)  26.55s  temperatures [1.0, 1.0]  <- ran the full ladder
+        multilingual default       8.22s  temperatures [0.2, 0.2]
+        temperature=0.0            3.94s  temperatures [0.0, 0.0]
+
+    For a short voice turn the greedy decode is already correct (the transcripts
+    were identical across all three), so paying 2-6x for a fallback ladder that
+    only fires on already-good audio is a bad trade. A failed decode returns text
+    with a poor avg_logprob, which the caller already uses to decide whether to
+    retry in another language -- that is the deliberate recovery path, not this one.
+    """
+    segments, info = model.transcribe(
+        file_path,
+        beam_size=5,
+        vad_filter=WHISPER_VAD_FILTER,
+        language=language,
+        multilingual=WHISPER_MULTILINGUAL,
+        # Do not let the decoder climb the temperature ladder: each rung is a full
+        # re-decode and it can turn a 4s turn into 26s.
+        temperature=0.0,
+        # Previous-window text can push a repeated or looping clip into worse
+        # decodes; for one-shot voice turns there is no useful context to carry.
+        condition_on_previous_text=False,
+    )
+    segments = list(segments)
+    log.info(
+        "Detected language '%s' with probability %f (requested %s)",
+        info.language,
+        info.language_probability,
+        language,
+    )
+    if not segments:
+        # Nothing survived VAD: silence, so there is no text and no confidence.
+        return '', None, info.language, info.language_probability
+    avg_logprob = sum(s.avg_logprob for s in segments) / len(segments)
+    return (
+        ''.join(segment.text for segment in segments),
+        avg_logprob,
+        info.language,
+        info.language_probability,
+    )
+
+
 async def _transcribe_whisper(request, file_path, languages, file_dir, id):
-    if request.app.state.faster_whisper_model is None:
-        request.app.state.faster_whisper_model = await asyncio.to_thread(
-            set_faster_whisper_model, await Config.get('audio.stt.whisper_model')
-        )
+    model = await ensure_faster_whisper_model(request.app)
+    requested = languages[0]
 
-    model = request.app.state.faster_whisper_model
+    transcript, avg_logprob, detected, _probability = await asyncio.to_thread(
+        _decode_whisper, model, file_path, requested
+    )
 
-    def _run():
-        segments, info = model.transcribe(
-            file_path,
-            beam_size=5,
-            vad_filter=WHISPER_VAD_FILTER,
-            language=languages[0],
-            multilingual=WHISPER_MULTILINGUAL,
-        )
-        log.info("Detected language '%s' with probability %f", info.language, info.language_probability)
-        return ''.join([segment.text for segment in list(segments)])
+    # Auto-detection on a short voice turn is unreliable: Whisper judges language
+    # from the first 30s but a turn is often 2-4s, and the decision is then locked
+    # for the whole clip. On this deployment that produced English speech decoded
+    # as Indonesian, and Indonesian speech decoded as English, with avg_logprob
+    # around -0.5 to -0.9. That both mistranslates the text and drags in
+    # temperature fallback (slow -- measured 24s versus 6s for a forced decode).
+    #
+    # Note the detection probability is NOT a usable trigger: one such clip
+    # reported p=0.95 while being wrong. The confidence of the decode itself is:
+    # a decode that agrees with the audio sits near -0.2 to -0.33, one fighting
+    # it falls to -0.48 or worse.
+    #
+    # So when the caller did not pin a language and the decode looks unconvincing,
+    # re-decode with each configured fallback language that is not the one already
+    # detected, and keep the most confident result. Candidates are tried in order
+    # and the loop stops as soon as one beats the original, so a normal turn costs
+    # nothing and an unconvincing one costs a single extra decode.
+    if requested is None and avg_logprob is not None and avg_logprob < WHISPER_LANGUAGE_RETRY_LOGPROB:
+        for retry_language in WHISPER_LANGUAGE_FALLBACK:
+            if retry_language == detected:
+                # Re-decoding the language we already chose would just reproduce
+                # the same result, so skip it rather than pay for it.
+                continue
 
-    transcript = await asyncio.to_thread(_run)
+            alt_text, alt_logprob, _alt_detected, _alt_probability = await asyncio.to_thread(
+                _decode_whisper, model, file_path, retry_language
+            )
+            if alt_logprob is not None and alt_logprob > avg_logprob:
+                log.info(
+                    "Retried decode as '%s' (avg_logprob %.3f > %.3f); keeping it",
+                    retry_language,
+                    alt_logprob,
+                    avg_logprob,
+                )
+                transcript = alt_text
+                avg_logprob = alt_logprob
+                detected = retry_language
+                break
+            log.info(
+                "Retried decode as '%s' but kept '%s' (avg_logprob %s <= %.3f)",
+                retry_language,
+                detected,
+                f'{alt_logprob:.3f}' if alt_logprob is not None else 'none',
+                avg_logprob,
+            )
+
     data = {'text': transcript.strip()}
 
     async with aiofiles.open(os.path.join(file_dir, f'{id}.json'), 'w') as f:
@@ -1712,6 +1918,162 @@ async def get_available_voices(request) -> dict:
                 log.error(f'Error fetching Mistral voices: {e}')
 
     return {}
+
+
+# ─────────────────────────── TTS health probe ───────────────────────────
+# Short-lived cache so a UI that polls this cannot hammer a dead upstream.
+_TTS_HEALTH_CACHE: dict[str, object] = {'at': 0.0, 'value': None}
+_TTS_HEALTH_TTL = 15.0
+
+
+def _classify_probe(url: str, status: int | None, error: str | None) -> tuple[bool, str]:
+    """Turn a probe outcome into (available, human detail).
+
+    A refused connection means the server is down. An HTTP status of any kind means it
+    IS reachable -- a 401/403 is a credential problem, not an outage, and conflating
+    the two would send an admin looking in the wrong place.
+    """
+    if status is not None:
+        # 2xx and 405 both mean the server is up and the speech route exists.
+        if status < 400 or status == 405:
+            return True, f'{url} is reachable (speech route responded HTTP {status})'
+        if status in (401, 403):
+            # Reachable but unauthorised: a credential problem, not an outage.
+            return False, f'{url} is reachable but rejected the API key (HTTP {status})'
+        if status == 404:
+            return False, f'{url} has no /audio/speech route (HTTP 404): check the base URL'
+        return False, f'{url} responded HTTP {status}'
+
+    # No status at all: distinguish "nothing is listening" from "too slow to answer",
+    # because the fixes are different.
+    reason = (error or '').lower()
+    if 'timed out' in reason or 'timeout' in reason:
+        return False, f'{url} did not respond in time ({error})'
+    if 'refused' in reason:
+        return False, f'{url} refused the connection (nothing listening)'
+    return False, f'{url} unreachable' + (f' ({error})' if error else '')
+
+
+async def _probe_tts_upstream(url: str, timeout: float) -> tuple[int | None, str | None]:
+    """Probe the speech route itself. Returns (http_status, error_text), never raises.
+
+    Probing `/models` was wrong: that is an LLM-catalogue route which a dedicated TTS
+    server does not implement. supertonic answered 404 there while serving audio
+    normally, so the check reported an outage that did not exist.
+
+    `OPTIONS /audio/speech` is the right probe: it exercises the real route without
+    synthesising anything. A 405 means the route exists but OPTIONS is not allowed,
+    which is still proof the server is up.
+    """
+    base = url.rstrip('/')
+    headers = {'Authorization': f'Bearer {await Config.get("audio.tts.openai.api_key") or ""}'}
+    client_timeout = aiohttp.ClientTimeout(total=timeout)
+
+    async def _attempt(method: str):
+        session = await get_session()
+        return session.request(
+            method,
+            f'{base}/audio/speech',
+            timeout=client_timeout,
+            ssl=AIOHTTP_CLIENT_SESSION_SSL,
+            headers=headers,
+        )
+
+    try:
+        session = await get_session()
+        # OPTIONS first: cheap, no synthesis, and 405 still proves the route exists.
+        async with await _attempt('OPTIONS') as r:
+            status = r.status
+        if status == 405:
+            # Route exists, method not allowed for OPTIONS. That is still "up".
+            return 405, None
+        if status >= 500:
+            # Present but failing: try one more time via HEAD to rule out a fluke.
+            try:
+                async with await _attempt('HEAD') as r2:
+                    return r2.status, None
+            except Exception:
+                return status, None
+        return status, None
+    except asyncio.TimeoutError:
+        return None, f'timed out after {timeout:.0f}s'
+    except aiohttp.ClientConnectorError:
+        return None, 'connection refused'
+    except aiohttp.ClientError as exc:
+        return None, type(exc).__name__
+    except Exception as exc:
+        return None, type(exc).__name__
+
+
+async def _tts_health() -> dict:
+    """Probe the configured TTS upstream. Cached briefly, never raises."""
+    now = time.time()
+    cached = _TTS_HEALTH_CACHE.get('value')
+    if cached is not None and (now - float(_TTS_HEALTH_CACHE.get('at') or 0)) < _TTS_HEALTH_TTL:
+        return {**cached, 'cached': True}
+
+    engine = await Config.get('audio.tts.engine') or ''
+    timeout = float(os.environ.get('TTS_HEALTH_TIMEOUT', '4'))
+
+    result: dict = {
+        'available': True,
+        'engine': engine,
+        'checked': [],
+        'detail': None,
+        'cached': False,
+    }
+
+    # Local engines need no network.
+    if engine in ('', 'transformers'):
+        result['detail'] = 'local engine, no upstream required'
+        _TTS_HEALTH_CACHE.update({'at': now, 'value': result})
+        return result
+
+    if engine == 'openai':
+        candidates = await _tts_base_url_candidates()
+    elif engine == 'mistral':
+        candidates = [await Config.get('audio.tts.mistral.api_base_url') or 'https://api.mistral.ai/v1']
+    elif engine == 'azure':
+        candidates = [await Config.get('audio.tts.azure.speech_base_url') or '']
+    elif engine == 'elevenlabs':
+        candidates = ['https://api.elevenlabs.io']
+    else:
+        candidates = []
+
+    candidates = [c for c in candidates if c]
+    result['checked'] = candidates
+
+    if not candidates:
+        result['available'] = False
+        result['detail'] = f'no upstream configured for engine {engine!r}'
+        _TTS_HEALTH_CACHE.update({'at': now, 'value': result})
+        return result
+
+    details = []
+    for url in candidates:
+        status, error = await _probe_tts_upstream(url, timeout)
+        ok, detail = _classify_probe(url, status, error)
+        details.append(detail)
+        if ok:
+            result['available'] = True
+            result['detail'] = detail
+            _TTS_HEALTH_CACHE.update({'at': now, 'value': result})
+            return result
+
+    result['available'] = False
+    result['detail'] = '; '.join(details)
+    _TTS_HEALTH_CACHE.update({'at': now, 'value': result})
+    return result
+
+
+@router.get('/tts/health')
+async def get_tts_health(request: Request, user=Depends(get_verified_user)):
+    """Report whether the configured TTS upstream is reachable.
+
+    The UI calls this before offering Speak, so an outage disables the button with an
+    explanation instead of letting the user wait for a failure.
+    """
+    return await _tts_health()
 
 
 @router.get('/voices')

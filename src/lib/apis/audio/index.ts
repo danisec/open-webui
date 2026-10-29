@@ -166,6 +166,42 @@ export const getModels = async (token: string = ''): Promise<AvailableModelsResp
 	return res;
 };
 
+export type TtsHealth = {
+	available: boolean;
+	engine: string;
+	checked: string[];
+	detail: string | null;
+	cached?: boolean;
+};
+
+/**
+ * Ask the backend whether the configured TTS upstream is reachable.
+ *
+ * Never throws: an unreachable server IS the answer, so a network error is reported
+ * as `available: false` rather than surfacing as an exception the UI must catch.
+ */
+export const getTtsHealth = async (token: string = ''): Promise<TtsHealth> => {
+	try {
+		const res = await fetch(`${AUDIO_API_BASE_URL}/tts/health`, {
+			method: 'GET',
+			headers: {
+				'Content-Type': 'application/json',
+				Authorization: `Bearer ${token}`
+			}
+		});
+		if (!res.ok) throw new Error(`HTTP ${res.status}`);
+		return await res.json();
+	} catch (err) {
+		console.error('TTS health check failed', err);
+		return {
+			available: false,
+			engine: '',
+			checked: [],
+			detail: 'could not reach the server to check TTS'
+		};
+	}
+};
+
 export const getVoices = async (token: string = '') => {
 	let error = null;
 

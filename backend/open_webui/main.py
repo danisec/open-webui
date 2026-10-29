@@ -69,6 +69,7 @@ from open_webui.config import (
     THREAD_POOL_THREAD_NAME_PREFIX,
     WEBUI_AUTH,
     WEBUI_NAME,
+    WHISPER_VAD_FILTER,
     async_reset_config,
     import_legacy_config_json,
     seed_registered_defaults,
@@ -428,6 +429,10 @@ async def lifespan(app: FastAPI):
     app.state.periodic_usage_pool_cleanup = asyncio.create_task(periodic_usage_pool_cleanup())
     app.state.periodic_session_pool_cleanup = asyncio.create_task(periodic_session_pool_cleanup())
 
+    from open_webui.utils.speech_cache import periodic_speech_cache_cleanup
+
+    app.state.periodic_speech_cache_cleanup = asyncio.create_task(periodic_speech_cache_cleanup())
+
     from open_webui.utils.automations import scheduler_worker_loop
 
     app.state.scheduler_worker_loop = asyncio.create_task(scheduler_worker_loop(app))
@@ -489,6 +494,34 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             log.warning(f'Failed to initialize terminal servers at startup: {e}')
 
+    # Warm the local Whisper model (and the Silero VAD it uses when
+    # WHISPER_VAD_FILTER is on) so the first voice turn after a restart does not
+    # pay the ~9.5s load cost. Runs in the background: blocking here would hold
+    # the readiness probe for the whole load. ensure_faster_whisper_model takes a
+    # lock, so a request arriving mid-warmup waits for this load instead of
+    # starting a second copy of the model.
+    if not USE_SLIM and (await Config.get('audio.stt.engine') or '') == '':
+
+        async def _warm_whisper():
+            try:
+                log.info('Warming local Whisper model...')
+                started = asyncio.get_running_loop().time()
+                model = await audio.ensure_faster_whisper_model(app)
+                if model is not None and WHISPER_VAD_FILTER:
+                    # Touching the VAD loads the Silero ONNX graph off disk.
+                    from faster_whisper.vad import get_vad_model
+
+                    await asyncio.to_thread(get_vad_model)
+                log.info(
+                    'Whisper model warmed in %.2fs',
+                    asyncio.get_running_loop().time() - started,
+                )
+            except Exception as e:
+                # Never fatal: transcription still loads lazily on first request.
+                log.warning(f'Whisper warmup failed, will load lazily on first request: {e}')
+
+        app.state.whisper_warmup_task = asyncio.create_task(_warm_whisper())
+
     # Mark application as ready to accept traffic from a startup perspective.
     if license_task:
         try:
@@ -522,7 +555,11 @@ async def lifespan(app: FastAPI):
     app.state.periodic_socket_authentication.cancel()
     app.state.periodic_usage_pool_cleanup.cancel()
     app.state.periodic_session_pool_cleanup.cancel()
+    app.state.periodic_speech_cache_cleanup.cancel()
     app.state.scheduler_worker_loop.cancel()
+
+    if hasattr(app.state, 'whisper_warmup_task'):
+        app.state.whisper_warmup_task.cancel()
 
     await publish_event(app, EVENTS.SYSTEM_SHUTDOWN_COMPLETED, source='system')
 

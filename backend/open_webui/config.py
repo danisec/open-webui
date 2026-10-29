@@ -1601,6 +1601,19 @@ WHISPER_MULTILINGUAL = os.getenv('WHISPER_MULTILINGUAL', 'False').lower() == 'tr
 
 WHISPER_LANGUAGE = os.getenv('WHISPER_LANGUAGE', '').lower() or None
 
+# Languages to re-decode with when the first decode is unconvincing. Comma
+# separated, so `en,id` lets a clip that auto-detected as either language be
+# re-checked against the other one. Empty disables the retry entirely.
+WHISPER_LANGUAGE_FALLBACK = [
+    lang.strip().lower() for lang in os.getenv('WHISPER_LANGUAGE_FALLBACK', '').split(',') if lang.strip()
+]
+
+# Mean per-token logprob threshold. Decodes that agree with the audio measured
+# -0.19 to -0.33 on this deployment's corpus; decodes fighting it measured
+# -0.48 and -0.93. The retry only runs below this, so a confident decode is
+# never second-guessed and never pays the extra latency.
+WHISPER_LANGUAGE_RETRY_LOGPROB = float(os.getenv('WHISPER_LANGUAGE_RETRY_LOGPROB', '-0.4'))
+
 # Add Deepgram configuration
 DEEPGRAM_API_KEY = os.getenv('DEEPGRAM_API_KEY', '')
 
@@ -1680,6 +1693,11 @@ AUDIO_REALTIME_TRANSCRIPTION_MODEL = os.getenv('AUDIO_REALTIME_TRANSCRIPTION_MOD
 REALTIME_CALL_PROMPT_TEMPLATE = os.getenv('REALTIME_CALL_PROMPT_TEMPLATE')
 
 AUDIO_TTS_SPLIT_ON = os.getenv('AUDIO_TTS_SPLIT_ON', 'punctuation')
+
+# Speech cache retention. Synthesized audio is stored permanently otherwise; see
+# open_webui/utils/speech_cache.py. 0 disables the corresponding bound.
+AUDIO_TTS_CACHE_MAX_AGE_DAYS = int(os.getenv('AUDIO_TTS_CACHE_MAX_AGE_DAYS', '14'))
+AUDIO_TTS_CACHE_MAX_SIZE_MB = int(os.getenv('AUDIO_TTS_CACHE_MAX_SIZE_MB', '500'))
 
 AUDIO_TTS_AZURE_SPEECH_REGION = os.getenv('AUDIO_TTS_AZURE_SPEECH_REGION', '')
 
@@ -3156,6 +3174,8 @@ DEFAULT_CONFIG = {
     'audio.tts.voice': AUDIO_TTS_VOICE,
     'audio.tts.realtime.prompt_template': REALTIME_TTS_PROMPT_TEMPLATE,
     'audio.tts.split_on': AUDIO_TTS_SPLIT_ON,
+    'audio.tts.cache_max_age_days': AUDIO_TTS_CACHE_MAX_AGE_DAYS,
+    'audio.tts.cache_max_size_mb': AUDIO_TTS_CACHE_MAX_SIZE_MB,
     'audio.tts.azure.speech_region': AUDIO_TTS_AZURE_SPEECH_REGION,
     'audio.tts.azure.speech_base_url': AUDIO_TTS_AZURE_SPEECH_BASE_URL,
     'audio.tts.azure.speech_output_format': AUDIO_TTS_AZURE_SPEECH_OUTPUT_FORMAT,
