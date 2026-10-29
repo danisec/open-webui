@@ -52,6 +52,23 @@
 	let modelIds = [];
 	let availableModelIds: string[] = [];
 
+	// Multiple API keys for one connection. Stored as `config.api_keys` (a list)
+	// alongside the single legacy key, which stays in the `key` field so existing
+	// deployments keep working and the first key remains visible in the row.
+	let apiKeys: string[] = [];
+	let apiKeyStrategy = 'round_robin';
+	let stickyTtl = 300;
+	let showApiKeys = false;
+
+	// Optional per-connection proxies. Stored as `config.proxies` (a list) with
+	// rotation, because an upstream may rate-limit or ban by source address and
+	// the only real remedy is to change the source address. `config.proxy` (the
+	// single legacy field) is still written when exactly one entry is present.
+	let proxyList: string[] = [];
+	let proxyStrategy = 'round_robin';
+	let proxyStickyTtl = 300;
+	let showProxies = false;
+
 	let loading = false;
 	let showDeleteConfirmDialog = false;
 	let showAdvanced = false;
@@ -232,6 +249,16 @@
 		// remove trailing slash from url
 		url = url.replace(/\/$/, '');
 
+		// A multi-key list is authoritative when present. The single `key` field
+		// mirrors its first entry so the collapsed row, the legacy
+		// `OPENAI_API_KEYS` array and every downstream caller that still reads one
+		// key keep working unchanged.
+		const cleanedKeys = apiKeys.map((k) => k.trim()).filter(Boolean);
+		const uniqueKeys = [...new Set(cleanedKeys)];
+		if (uniqueKeys.length > 0) {
+			key = uniqueKeys[0];
+		}
+
 		const connection = {
 			url,
 			key,
@@ -248,7 +275,29 @@
 				...(provider ? { provider } : {}),
 				...(!ollama && azure ? { azure: true } : {}),
 				...(azure ? { api_version: apiVersion } : {}),
-				...(apiType ? { api_type: apiType } : {})
+				...(apiType ? { api_type: apiType } : {}),
+				// Omitted when there is nothing to rotate, so a single-key connection
+				// stores exactly what it did before this feature existed.
+				...(uniqueKeys.length > 1 ? { api_keys: uniqueKeys } : {}),
+				...(uniqueKeys.length > 1 ? { api_key_strategy: apiKeyStrategy } : {}),
+				...(uniqueKeys.length > 1 && apiKeyStrategy === 'sticky'
+					? { sticky_ttl: Number(stickyTtl) || 300 }
+					: {}),
+				// Proxies: a list enables rotation. A single entry is mirrored into
+				// the legacy `proxy` field so one-proxy connections store exactly
+				// what they did before rotation existed.
+				...(() => {
+					const cleaned = [...new Set(proxyList.map((p) => p.trim()).filter(Boolean))];
+					if (cleaned.length === 0) return {};
+					if (cleaned.length === 1) return { proxy: cleaned[0] };
+					return {
+						proxies: cleaned,
+						proxy_strategy: proxyStrategy,
+						...(proxyStrategy === 'sticky'
+							? { proxy_sticky_ttl: Number(proxyStickyTtl) || 300 }
+							: {})
+					};
+				})()
 			}
 		};
 
@@ -272,11 +321,30 @@
 		provider = '';
 		apiVersion = '';
 		apiType = '';
+		apiKeys = [];
+		apiKeyStrategy = 'round_robin';
+		stickyTtl = 300;
+		showApiKeys = false;
+		proxyList = [];
+		proxyStrategy = 'round_robin';
+		proxyStickyTtl = 300;
+		showProxies = false;
 	};
 
 	const init = () => {
 		availableModelIds = [];
 		forwardCookies = connection?.config?.forward_cookies ?? false;
+		// Reset the multi-key state on every open: the modal is reused for different
+		// connections, so leaving the previous list here would show one connection's
+		// keys while saving another's.
+		apiKeys = [];
+		apiKeyStrategy = 'round_robin';
+		stickyTtl = 300;
+		showApiKeys = false;
+		proxyList = [];
+		proxyStrategy = 'round_robin';
+		proxyStickyTtl = 300;
+		showProxies = false;
 		if (connection) {
 			url = connection.url;
 			key = connection.key;
@@ -293,6 +361,27 @@
 				? connection.config.passthrough_params.join(', ')
 				: (connection.config?.passthrough_params ?? '');
 			modelIds = [...new Set(connection.config?.model_ids ?? [])];
+
+			const storedKeys = connection.config?.api_keys;
+			if (Array.isArray(storedKeys) && storedKeys.length > 0) {
+				apiKeys = [...storedKeys];
+			} else if (connection.key) {
+				// Seed the list with the single legacy key so the admin can extend it
+				// instead of retyping the key they already have.
+				apiKeys = [connection.key];
+			}
+			apiKeyStrategy = connection.config?.api_key_strategy ?? 'round_robin';
+			stickyTtl = connection.config?.sticky_ttl ?? 300;
+			const storedProxies = connection.config?.proxies;
+			if (Array.isArray(storedProxies) && storedProxies.length > 0) {
+				proxyList = [...storedProxies];
+				showProxies = true;
+			} else if (connection.config?.proxy) {
+				proxyList = [connection.config.proxy];
+			}
+			proxyStrategy = connection.config?.proxy_strategy ?? 'round_robin';
+			proxyStickyTtl = connection.config?.proxy_sticky_ttl ?? 300;
+			showApiKeys = Array.isArray(storedKeys) && storedKeys.length > 1;
 
 			if (ollama) {
 				connectionType = connection.config?.connection_type ?? 'local';
@@ -499,6 +588,253 @@
 								</div>
 							</div>
 						</div>
+
+						{#if auth_type === 'bearer' && !ollama && !direct}
+							<!-- Multiple keys on one connection, rotated per request. -->
+							<div class="mt-2">
+								<button
+									type="button"
+									class="flex items-center gap-1 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 transition"
+									on:click={() => (showApiKeys = !showApiKeys)}
+									aria-expanded={showApiKeys}
+								>
+									<svg
+										xmlns="http://www.w3.org/2000/svg"
+										viewBox="0 0 20 20"
+										fill="currentColor"
+										class="w-3 h-3 transition-transform {showApiKeys ? 'rotate-90' : ''}"
+									>
+										<path
+											fill-rule="evenodd"
+											d="M7.21 14.77a.75.75 0 01.02-1.06L11.168 10 7.23 6.29a.75.75 0 111.04-1.08l4.5 4.25a.75.75 0 010 1.08l-4.5 4.25a.75.75 0 01-1.06-.02z"
+											clip-rule="evenodd"
+										/>
+									</svg>
+									{$i18n.t('Multiple API Keys')}
+									{#if apiKeys.filter((k) => k.trim()).length > 1}
+										<span
+											class="ml-1 rounded-full bg-gray-100 px-1.5 text-[10px] text-gray-600 dark:bg-gray-800 dark:text-gray-300"
+										>
+											{apiKeys.filter((k) => k.trim()).length}
+										</span>
+									{/if}
+								</button>
+
+								{#if showApiKeys}
+									<div class="mt-1.5">
+										<p class="mb-1 text-xs text-gray-500">
+											{$i18n.t(
+												'Rotate between these keys. Leave empty to use the single key above.'
+											)}
+										</p>
+
+										{#each apiKeys as _apiKey, apiKeyIdx}
+											<div class="flex items-center gap-1">
+												<SensitiveInput
+													bind:value={apiKeys[apiKeyIdx]}
+													placeholder={$i18n.t('API Key')}
+													required={false}
+												/>
+												<button
+													type="button"
+													aria-label={$i18n.t('Remove key')}
+													class="shrink-0 p-1 text-gray-400 hover:text-gray-700 dark:hover:text-gray-200"
+													on:click={() => {
+														apiKeys = apiKeys.filter((_, i) => i !== apiKeyIdx);
+													}}
+												>
+													<Minus strokeWidth="2" className="size-3.5" />
+												</button>
+											</div>
+										{/each}
+
+										<button
+											type="button"
+											class="mt-1 flex items-center gap-1 text-xs text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
+											on:click={() => (apiKeys = [...apiKeys, ''])}
+										>
+											<Plus className="size-3.5" strokeWidth="2" />
+											{$i18n.t('Add key')}
+										</button>
+
+										{#if apiKeys.filter((k) => k.trim()).length > 1}
+											<div class="mt-2 flex flex-row justify-between items-center w-full">
+												<label for="api-key-strategy" class="text-xs text-gray-500">
+													{$i18n.t('Rotation')}
+												</label>
+												<select
+													id="api-key-strategy"
+													bind:value={apiKeyStrategy}
+													class="text-xs text-gray-700 dark:text-gray-300 bg-transparent pr-5 outline-hidden"
+												>
+													<option value="round_robin">
+														{$i18n.t('Round Robin')}
+													</option>
+													<option value="sticky">
+														{$i18n.t('Sticky')}
+													</option>
+												</select>
+											</div>
+
+											{#if apiKeyStrategy === 'sticky'}
+												<div class="mt-2 flex gap-2 items-center">
+													<div class="flex flex-col w-full">
+														<label for="sticky-ttl-input" class="mb-0.5 text-xs text-gray-500">
+															{$i18n.t('Sticky window (seconds)')}
+														</label>
+														<input
+															id="sticky-ttl-input"
+															class={`w-full text-sm ${inputClass}`}
+															type="number"
+															min="0"
+															bind:value={stickyTtl}
+															placeholder="300"
+															autocomplete="off"
+														/>
+													</div>
+												</div>
+												<p class="mt-1 text-xs text-gray-500">
+													{$i18n.t(
+														'One key is reused for this long before rotating. Good for upstream prompt caching.'
+													)}
+												</p>
+											{/if}
+										{/if}
+									</div>
+								{/if}
+							</div>
+						{/if}
+
+						{#if !ollama && !direct}
+							<!-- Per-connection proxies. Only this connection's outbound
+							     requests use them; other connections are unaffected.
+							     A list enables rotation, which is the only remedy for an
+							     upstream that rate-limits by source address. -->
+							<div class="mt-3">
+								<div class="flex items-center justify-between">
+									<label
+										for="connection-proxy"
+										class="mb-0.5 block text-xs font-medium text-gray-500 dark:text-gray-400"
+									>
+										{$i18n.t('Proxy (optional)')}
+									</label>
+									{#if proxyList.filter((p) => p.trim()).length > 1}
+										<span
+											class="rounded-full bg-gray-100 px-1.5 text-[10px] text-gray-600 dark:bg-gray-800 dark:text-gray-300"
+										>
+											{proxyList.filter((p) => p.trim()).length}
+										</span>
+									{/if}
+								</div>
+
+								{#if !showProxies}
+									<!-- Single proxy: the simple path, unchanged. -->
+									<input
+										id="connection-proxy"
+										class={`w-full text-sm ${inputClass}`}
+										type="text"
+										bind:value={proxyList[0]}
+										placeholder="socks5://user:pass@host:1080"
+										autocomplete="off"
+										spellcheck="false"
+									/>
+								{:else}
+									<div class="space-y-1">
+										{#each proxyList as _proxy, proxyIdx}
+											<div class="flex items-center gap-1">
+												<input
+													class={`w-full text-sm ${inputClass}`}
+													type="text"
+													bind:value={proxyList[proxyIdx]}
+													placeholder="socks5://user:pass@host:1080"
+													autocomplete="off"
+													spellcheck="false"
+													aria-label={$i18n.t('Proxy')}
+												/>
+												<button
+													type="button"
+													aria-label={$i18n.t('Remove proxy')}
+													class="shrink-0 p-1 text-gray-400 hover:text-gray-700 dark:hover:text-gray-200"
+													on:click={() => {
+														proxyList = proxyList.filter((_, i) => i !== proxyIdx);
+													}}
+												>
+													<Minus strokeWidth="2" className="size-3.5" />
+												</button>
+											</div>
+										{/each}
+									</div>
+								{/if}
+
+								<div class="mt-1 flex items-center gap-3">
+									<button
+										type="button"
+										class="flex items-center gap-1 text-xs text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
+										on:click={() => {
+											showProxies = true;
+											if (proxyList.length === 0) proxyList = [''];
+											else proxyList = [...proxyList, ''];
+										}}
+									>
+										<Plus className="size-3.5" strokeWidth="2" />
+										{$i18n.t('Add proxy')}
+									</button>
+									{#if showProxies}
+										<button
+											type="button"
+											class="text-xs text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
+											on:click={() => {
+												showProxies = false;
+												proxyList = proxyList.slice(0, 1);
+											}}
+										>
+											{$i18n.t('Use a single proxy')}
+										</button>
+									{/if}
+								</div>
+
+								{#if proxyList.filter((p) => p.trim()).length > 1}
+									<div class="mt-2 flex flex-row justify-between items-center w-full">
+										<label for="proxy-strategy" class="text-xs text-gray-500">
+											{$i18n.t('Proxy rotation')}
+										</label>
+										<select
+											id="proxy-strategy"
+											bind:value={proxyStrategy}
+											class="text-xs text-gray-700 dark:text-gray-300 bg-transparent pr-5 outline-hidden"
+										>
+											<option value="round_robin">{$i18n.t('Round Robin')}</option>
+											<option value="sticky">{$i18n.t('Sticky')}</option>
+										</select>
+									</div>
+
+									{#if proxyStrategy === 'sticky'}
+										<div class="mt-2 flex gap-2 items-center">
+											<div class="flex flex-col w-full">
+												<label for="proxy-sticky-ttl" class="mb-0.5 text-xs text-gray-500">
+													{$i18n.t('Sticky window (seconds)')}
+												</label>
+												<input
+													id="proxy-sticky-ttl"
+													class={`w-full text-sm ${inputClass}`}
+													type="number"
+													min="0"
+													bind:value={proxyStickyTtl}
+													placeholder="300"
+													autocomplete="off"
+												/>
+											</div>
+										</div>
+									{/if}
+								{/if}
+
+								<p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+									{$i18n.t(
+										'Route only this connection through a proxy. Supports socks5://, socks4://, http:// and https://. Add more than one to rotate between source addresses.'
+									)}
+								</p>
+							</div>
+						{/if}
 
 						{#if !ollama && !direct}
 							<div class="flex flex-row justify-between items-center w-full mt-1">

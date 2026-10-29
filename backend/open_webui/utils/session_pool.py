@@ -1,28 +1,41 @@
-"""Shared aiohttp ClientSession pool.
+"""Shared aiohttp ClientSession pool, with optional per-proxy sessions.
 
-Instead of creating a new ClientSession (and TCPConnector) per request,
-callers acquire a long-lived session from this module.  The pool manages
-a single TCPConnector with configurable limits, enabling TCP/SSL connection
-reuse, shared DNS cache, and bounded concurrency.
+Instead of creating a new ClientSession (and connector) per request, callers
+acquire a long-lived session from this module.  The pool manages one connector
+per distinct proxy (plus one for direct traffic) with configurable limits,
+enabling TCP/SSL connection reuse, shared DNS cache, and bounded concurrency.
 
 All pool parameters are configurable via environment variables:
     - AIOHTTP_POOL_CONNECTIONS (default 100) — max total connections
     - AIOHTTP_POOL_CONNECTIONS_PER_HOST (default 30) — per-host limit
     - AIOHTTP_POOL_DNS_TTL (default 300) — DNS cache TTL in seconds
 
+PROXIES
+A connection may name its own proxy (Settings → Connections). aiohttp has no
+native SOCKS support, so a SOCKS proxy needs ``aiohttp_socks.ProxyConnector``;
+HTTP proxies use aiohttp's built-in ``proxy=`` support. Because a ClientSession
+owns exactly one connector, and a connector owns its proxy, one shared session
+*cannot* serve two connections with different proxies. Hence one session per
+distinct proxy, cached and reused.
+
+Callers that pass no proxy get the original shared session and behave exactly
+as before — all existing call sites are unaffected.
+
 Usage:
     from open_webui.utils.session_pool import get_session, cleanup_response
 
-    session = await get_session()
+    session = await get_session()              # direct / environment proxy
+    session = await get_session(proxy_url)     # per-connection proxy
     r = await session.request(...)
     # When done with the *response* (not the session):
     await cleanup_response(r)
 
 IMPORTANT: Callers must NOT close the shared session.  Only the response
-needs cleanup.  The session is closed once during application shutdown
+needs cleanup.  Sessions are closed once during application shutdown
 via ``close_session()``.
 """
 
+import asyncio
 import logging
 from typing import Optional
 
@@ -35,10 +48,14 @@ from open_webui.env import (
     AIOHTTP_POOL_DNS_TTL,
 )
 from open_webui.utils.misc import stream_chunks_handler
+from open_webui.utils.proxy_config import is_socks, mask_proxy, normalize_proxy
 
 log = logging.getLogger(__name__)
 
-_session: Optional[aiohttp.ClientSession] = None
+# Sessions keyed by normalised proxy URL; '' is the direct (no per-connection
+# proxy) session, which keeps the original single-session behaviour.
+_sessions: dict[str, aiohttp.ClientSession] = {}
+_locks: dict[str, asyncio.Lock] = {}
 
 _CLIENT_TIMEOUT = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
 _CLIENT_STREAM_TIMEOUT = aiohttp.ClientTimeout(
@@ -51,45 +68,119 @@ def get_client_timeout(stream: bool = False) -> aiohttp.ClientTimeout:
     return _CLIENT_STREAM_TIMEOUT if stream else _CLIENT_TIMEOUT
 
 
-async def get_session() -> aiohttp.ClientSession:
-    """Return the shared aiohttp ClientSession, creating it lazily."""
-    global _session
-    if _session is None or _session.closed:
-        connector_kwargs = {
-            'ttl_dns_cache': AIOHTTP_POOL_DNS_TTL,
-            'enable_cleanup_closed': True,
-        }
-        if AIOHTTP_POOL_CONNECTIONS is not None:
-            connector_kwargs['limit'] = AIOHTTP_POOL_CONNECTIONS
-        else:
-            connector_kwargs['limit'] = 0  # aiohttp: 0 = unlimited
-        if AIOHTTP_POOL_CONNECTIONS_PER_HOST is not None:
-            connector_kwargs['limit_per_host'] = AIOHTTP_POOL_CONNECTIONS_PER_HOST
-        else:
-            connector_kwargs['limit_per_host'] = 0  # aiohttp: 0 = unlimited
-        connector = aiohttp.TCPConnector(**connector_kwargs)
-        timeout = get_client_timeout()
-        _session = aiohttp.ClientSession(
+def _connector_limits() -> dict:
+    limits = {}
+    limits['limit'] = AIOHTTP_POOL_CONNECTIONS if AIOHTTP_POOL_CONNECTIONS is not None else 0
+    limits['limit_per_host'] = AIOHTTP_POOL_CONNECTIONS_PER_HOST if AIOHTTP_POOL_CONNECTIONS_PER_HOST is not None else 0
+    return limits
+
+
+def _build_connector(proxy: str) -> aiohttp.BaseConnector:
+    """Connector for a normalised proxy URL.
+
+    SOCKS needs aiohttp_socks; HTTP(S) proxies are handled by aiohttp's own
+    ``proxy=`` argument and therefore keep the plain TCPConnector.
+    """
+    limits = _connector_limits()
+
+    if not proxy:
+        return aiohttp.TCPConnector(
+            ttl_dns_cache=AIOHTTP_POOL_DNS_TTL,
+            enable_cleanup_closed=True,
+            **limits,
+        )
+
+    if is_socks(proxy):
+        try:
+            from aiohttp_socks import ProxyConnector
+        except ImportError as error:  # pragma: no cover - dependency is pinned
+            raise RuntimeError(
+                'A SOCKS proxy is configured but aiohttp-socks is not installed. '
+                'Install it (it is in requirements.txt) or use an http:// proxy.'
+            ) from error
+        return ProxyConnector.from_url(
+            proxy,
+            # Proxy-side DNS resolution is the point of a SOCKS proxy for
+            # rate-limited upstreams: the request must appear to originate from
+            # the proxy's address, not this host's.
+            rdns=True,
+            **limits,
+        )
+
+    # http:// or https:// proxy: aiohttp handles it per-request via proxy=.
+    return aiohttp.TCPConnector(
+        ttl_dns_cache=AIOHTTP_POOL_DNS_TTL,
+        enable_cleanup_closed=True,
+        **limits,
+    )
+
+
+async def get_session(proxy: str | None = None) -> aiohttp.ClientSession:
+    """Return a shared ClientSession, optionally bound to a proxy.
+
+    ``proxy`` is normalised first; an empty/None value returns the original
+    direct session. Each distinct proxy gets its own cached session, because a
+    session's connector fixes the proxy for its whole lifetime.
+    """
+    key = ''
+    if proxy:
+        key = normalize_proxy(proxy)
+
+    session = _sessions.get(key)
+    if session is not None and not session.closed:
+        return session
+
+    # Serialise creation per key so two concurrent first requests cannot leak a
+    # second session (and its connector) for the same proxy.
+    lock = _locks.setdefault(key, asyncio.Lock())
+    async with lock:
+        session = _sessions.get(key)
+        if session is not None and not session.closed:
+            return session
+
+        connector = _build_connector(key)
+        # trust_env must be off when a per-connection proxy is set: otherwise
+        # HTTPS_PROXY from the environment would also apply and the two would
+        # silently conflict. For the direct session, keep the original
+        # behaviour so deployments relying on env proxies are unaffected.
+        _sessions[key] = aiohttp.ClientSession(
             connector=connector,
-            timeout=timeout,
-            trust_env=True,
+            timeout=get_client_timeout(),
+            trust_env=not key,
         )
         log.info(
-            'Created shared aiohttp session pool (limit=%s, per_host=%s, dns_ttl=%d)',
+            'Created aiohttp session pool (proxy=%s, limit=%s, per_host=%s, dns_ttl=%d)',
+            mask_proxy(key) or 'direct',
             AIOHTTP_POOL_CONNECTIONS or 'unlimited',
             AIOHTTP_POOL_CONNECTIONS_PER_HOST or 'unlimited',
             AIOHTTP_POOL_DNS_TTL,
         )
-    return _session
+        return _sessions[key]
+
+
+def session_uses_proxy(session: aiohttp.ClientSession) -> bool:
+    """True when this session was created for a proxy.
+
+    aiohttp needs ``proxy=`` per request for HTTP proxies but never for SOCKS
+    (the connector already tunneled), so callers use this to decide.
+    """
+    for key, candidate in _sessions.items():
+        if candidate is session:
+            return bool(key) and not is_socks(key)
+    return False
 
 
 async def close_session():
-    """Close the shared session.  Called during application shutdown."""
-    global _session
-    if _session and not _session.closed:
-        await _session.close()
-        log.info('Closed shared aiohttp session pool')
-        _session = None
+    """Close every pooled session. Called during application shutdown."""
+    global _sessions
+    for key, session in list(_sessions.items()):
+        if session and not session.closed:
+            result = session.close()
+            if result is not None:
+                await result
+            log.info('Closed aiohttp session pool (proxy=%s)', mask_proxy(key) or 'direct')
+    _sessions = {}
+    _locks.clear()
 
 
 async def cleanup_response(

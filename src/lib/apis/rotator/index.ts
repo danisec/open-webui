@@ -45,7 +45,12 @@ export const createRotatorAlias = async (
 export const updateRotatorAlias = async (
 	token: string,
 	aliasId: string,
-	payload: { name?: string; priority?: string[] }
+	payload: {
+		name?: string;
+		priority?: string[];
+		strategy?: 'priority' | 'round-robin';
+		weights?: Record<string, number>;
+	}
 ) => {
 	const res = await request(token, 'PUT', `/aliases/${encodeURIComponent(aliasId)}`, payload);
 	return { data: res, error: null };

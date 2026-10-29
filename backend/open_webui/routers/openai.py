@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import logging
 import re
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import quote, urlparse
 
 import aiofiles
@@ -39,6 +39,13 @@ from open_webui.models.models import Models
 from open_webui.models.users import UserModel
 from open_webui.utils.access_control import check_model_access, has_connection_access, has_permission
 from open_webui.utils.anthropic import ANTHROPIC_VERSION, get_anthropic_models, is_anthropic_url
+from open_webui.utils.api_key_rotation import (
+    describe as describe_api_keys,
+    resolve_keys,
+    select_key,
+    strategy_of,
+    sticky_ttl_of,
+)
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.headers import get_headers_and_cookies, include_user_info_headers
 from open_webui.utils.json_codec import JSONCodec
@@ -53,6 +60,14 @@ from open_webui.utils.session_pool import (
     get_client_timeout,
     get_session,
     stream_wrapper,
+)
+from open_webui.utils.proxy_config import (
+    ProxyConfigError,
+    describe_proxy,
+    normalize_proxy,
+    proxy_from_config,
+    request_proxy_kwargs,
+    resolve_proxies,
 )
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -91,26 +106,30 @@ async def send_get_request(
     user: UserModel = None,
     config=None,
 ):
+    proxy = connection_proxy(config)
     try:
-        async with aiohttp.ClientSession(timeout=_MODEL_LIST_TIMEOUT, trust_env=True) as session:
-            if request and config:
-                headers, cookies = await get_headers_and_cookies(request, url, key, config, user=user)
-            else:
-                headers = {
-                    **({'Authorization': f'Bearer {key}'} if key else {}),
-                }
-                cookies = None
+        # Use the pool (not a throwaway session) so a per-connection proxy is
+        # honoured and connections are reused across model-list refreshes.
+        session = await get_session(proxy)
+        if request and config:
+            headers, cookies = await get_headers_and_cookies(request, url, key, config, user=user)
+        else:
+            headers = {
+                **({'Authorization': f'Bearer {key}'} if key else {}),
+            }
+            cookies = None
 
-                if ENABLE_FORWARD_USER_INFO_HEADERS and user:
-                    headers = include_user_info_headers(headers, user, request=request)
+            if ENABLE_FORWARD_USER_INFO_HEADERS and user:
+                headers = include_user_info_headers(headers, user, request=request)
 
-            async with session.get(
-                url,
-                headers=headers,
-                cookies=cookies,
-                ssl=AIOHTTP_CLIENT_SESSION_SSL,
-            ) as response:
-                return await response.json(loads=JSONCodec.loads)
+        async with session.get(
+            url,
+            headers=headers,
+            cookies=cookies,
+            ssl=AIOHTTP_CLIENT_SESSION_SSL,
+            **request_proxy_kwargs(proxy),
+        ) as response:
+            return await response.json(loads=JSONCodec.loads)
     except Exception as e:
         # Handle connection error here
         log.error(f'Connection error: {e}')
@@ -255,9 +274,46 @@ async def normalize_openai_api_keys(api_base_urls: list[str], api_keys: list[str
 async def get_openai_connection(idx: int) -> tuple[str, str, dict]:
     _, api_base_urls, api_keys, api_configs = await get_openai_runtime_config()
     url = api_base_urls[idx]
-    key = api_keys[idx]
     api_config = api_configs.get(str(idx), api_configs.get(url, {}))
+
+    # One connection may hold several API keys. When it does, one is chosen here,
+    # per request, so every caller of this function rotates automatically -- the
+    # chat route, the responses route, model listing, speech and the rest all go
+    # through this single point.
+    #
+    # `api_keys[idx]` remains the source when no list is configured, so existing
+    # deployments behave exactly as before.
+    keys = resolve_keys(api_config, api_keys[idx] if idx < len(api_keys) else '')
+    if len(keys) > 1:
+        key = select_key(
+            connection_key=f'{idx}:{url}',
+            keys=keys,
+            strategy=strategy_of(api_config),
+            sticky_ttl=sticky_ttl_of(api_config),
+        )
+        log.debug(
+            'api key rotation: connection %s using 1 of %d keys (%s)',
+            idx,
+            len(keys),
+            strategy_of(api_config),
+        )
+    else:
+        key = keys[0] if keys else ''
+
     return url, key, api_config
+
+
+def connection_proxy(api_config: dict | None, connection_key: Any = '') -> str:
+    """Proxy for one request on this connection, or '' when it uses none.
+
+    Handles both forms: a single `proxy` string and a `proxies` list with
+    rotation. `connection_key` namespaces the rotation cursor, so two
+    connections with proxy lists do not advance each other's position.
+
+    Kept as a thin wrapper so every call site reads the same way and an invalid
+    stored value degrades to "no proxy" instead of raising on every request.
+    """
+    return resolve_proxies(api_config, connection_key)
 
 
 async def clear_models_cache(request: Request):
@@ -327,8 +383,9 @@ async def send_model_management_request(
 
     response = None
     streaming = False
+    proxy = connection_proxy(api_config)
     try:
-        session = await get_session()
+        session = await get_session(proxy)
         response = await session.request(
             method,
             f'{root_url}{path}',
@@ -338,6 +395,7 @@ async def send_model_management_request(
             cookies=cookies,
             ssl=AIOHTTP_CLIENT_SESSION_SSL,
             timeout=get_client_timeout(stream=stream),
+            **request_proxy_kwargs(proxy),
         )
 
         if not response.ok:
@@ -405,17 +463,20 @@ async def get_anthropic_request_target(request: Request, form_data: dict, user: 
             headers.pop('Authorization', None)
             headers.setdefault('x-api-key', key)
 
-    return requested_model, payload, url, key, headers, cookies
+    return requested_model, payload, url, key, headers, cookies, api_config
 
 
 async def count_anthropic_tokens(request: Request, form_data: dict, user: UserModel) -> int:
     """Forward an Anthropic token-count request through an OpenAI-compatible connection."""
-    requested_model, payload, url, key, headers, cookies = await get_anthropic_request_target(request, form_data, user)
+    requested_model, payload, url, key, headers, cookies, api_config = await get_anthropic_request_target(
+        request, form_data, user
+    )
     request_url = f'{url.rstrip("/")}/messages/count_tokens'
     response = None
 
+    proxy = connection_proxy(api_config)
     try:
-        session = await get_session()
+        session = await get_session(proxy)
         response = await session.request(
             method='POST',
             url=request_url,
@@ -424,6 +485,7 @@ async def count_anthropic_tokens(request: Request, form_data: dict, user: UserMo
             cookies=cookies,
             ssl=AIOHTTP_CLIENT_SESSION_SSL,
             timeout=get_client_timeout(),
+            **request_proxy_kwargs(proxy),
         )
 
         try:
@@ -493,6 +555,19 @@ async def update_config(request: Request, form_data: OpenAIConfigForm, user=Depe
 
     await clear_models_cache(request)
 
+    # Log the key setup per connection: an admin who configured five keys and sees
+    # "key_count: 1" here has a form/serialisation problem, not an upstream one.
+    for idx, api_config in api_configs.items():
+        info = describe_api_keys(api_config, api_keys[int(idx)] if int(idx) < len(api_keys) else '')
+        if info['key_count'] > 1:
+            log.info(
+                'openai connection %s: %d API keys, strategy=%s, sticky_ttl=%ss',
+                idx,
+                info['key_count'],
+                info['strategy'],
+                info['sticky_ttl'],
+            )
+
     await publish_event(
         request,
         EVENTS.MODEL_PROVIDER_CONFIG_UPDATED,
@@ -544,14 +619,16 @@ async def speech(request: Request, user=Depends(get_verified_user)):
         headers, cookies = await get_headers_and_cookies(request, url, key, api_config, user=user)
 
         r = None
+        proxy = connection_proxy(api_config)
         try:
-            session = await get_session()
+            session = await get_session(proxy)
             r = await session.post(
                 url=f'{url}/audio/speech',
                 data=body,
                 headers=headers,
                 cookies=cookies,
                 ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                **request_proxy_kwargs(proxy),
             )
 
             r.raise_for_status()
@@ -816,11 +893,13 @@ async def get_models(request: Request, url_idx: int | None = None, user=Depends(
                     if models is None:
                         raise Exception('Failed to connect to Anthropic API')
                 else:
+                    proxy = connection_proxy(api_config)
                     async with session.get(
                         f'{url}/models',
                         headers=headers,
                         cookies=cookies,
                         ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                        **request_proxy_kwargs(proxy),
                     ) as r:
                         if r.status != 200:
                             error_detail = f'HTTP Error: {r.status}'
@@ -993,81 +1072,161 @@ async def verify_connection(
 
     api_config = form_data.config or {}
 
-    async with aiohttp.ClientSession(
-        trust_env=True,
-        timeout=_MODEL_LIST_TIMEOUT,
-    ) as session:
+    # A connection may carry several keys. Verify all of them, not just the first:
+    # an admin who pastes five keys needs to know which ones are dead, otherwise a
+    # bad key silently takes a share of traffic.
+    candidate_keys = resolve_keys(api_config, key)
+    proxy_report = describe_proxy(api_config)
+
+    if len(candidate_keys) <= 1:
+        result = await _verify_single_connection(request, url, key, api_config, user)
+        # Surface the proxy state on every path: an admin debugging a failed
+        # verify needs to know whether the request even left through a proxy.
+        if isinstance(result, dict):
+            return {**result, '_proxy_report': proxy_report}
+        return result
+
+    results = []
+    first_ok = None
+    for candidate in candidate_keys:
+        masked = f'{candidate[:6]}...{candidate[-4:]}' if len(candidate) > 12 else '***'
         try:
-            headers, cookies = await get_headers_and_cookies(request, url, key, api_config, user=user)
+            result = await _verify_single_connection(request, url, candidate, api_config, user)
+        except HTTPException as error:
+            results.append({'key': masked, 'ok': False, 'detail': str(error.detail)[:200]})
+            continue
 
-            if api_config.get('azure') or api_config.get('provider') == 'azure':
-                # Only set api-key header if not using Azure Entra ID authentication
-                auth_type = api_config.get('auth_type', 'bearer')
-                if auth_type not in ('azure_ad', 'microsoft_entra_id'):
-                    headers['api-key'] = key
+        # `_verify_single_connection` reports a rejected key by RETURNING a
+        # JSONResponse/PlainTextResponse with a non-200 status, not by raising. An
+        # earlier version of this loop only caught exceptions, so every key was
+        # reported usable -- including deliberately invalid ones, which the upstream
+        # answered with 401. Check the returned status, not just for exceptions.
+        status_code = getattr(result, 'status_code', None)
+        if status_code is not None and status_code != 200:
+            body = getattr(result, 'body', b'')
+            try:
+                detail = body.decode()[:200] if isinstance(body, bytes) else str(body)[:200]
+            except Exception:
+                detail = 'rejected'
+            results.append({'key': masked, 'ok': False, 'detail': f'HTTP {status_code}: {detail}'})
+            continue
 
-                # Azure v1 format: base URL already ends with /openai/v1,
-                # use standard /models endpoint without api-version.
-                is_azure_v1 = bool(re.search(r'/openai/v1(?:/|$)', url))
+        results.append({'key': masked, 'ok': True, 'detail': None})
+        if first_ok is None:
+            first_ok = result
 
-                if is_azure_v1:
-                    verify_url = f'{url.rstrip("/")}/models'
-                else:
-                    api_version = api_config.get('api_version', '') or '2023-03-15-preview'
-                    verify_url = f'{url}/openai/models?api-version={api_version}'
+    ok_count = sum(1 for item in results if item['ok'])
+    log.info('verify: %d/%d keys usable for %s', ok_count, len(results), url)
 
-                async with session.get(
-                    url=verify_url,
-                    headers=headers,
-                    cookies=cookies,
-                    ssl=AIOHTTP_CLIENT_SESSION_SSL,
-                ) as r:
-                    try:
-                        response_data = await r.json(loads=JSONCodec.loads)
-                    except Exception:
-                        response_data = await r.text()
+    # Return the first successful payload (so the model-id list still populates)
+    # plus the per-key report, which the UI shows.
+    if first_ok is None:
+        raise HTTPException(
+            status_code=400,
+            detail={'message': 'No configured API key could authenticate', 'keys': results},
+        )
 
-                    if r.status != 200:
-                        if isinstance(response_data, (dict, list)):
-                            return JSONResponse(status_code=r.status, content=response_data)
-                        else:
-                            return PlainTextResponse(status_code=r.status, content=response_data)
+    if isinstance(first_ok, dict):
+        return {**first_ok, '_key_report': results, '_proxy_report': proxy_report}
+    return first_ok
 
-                    return response_data
-            elif is_anthropic_url(url):
-                result = await get_anthropic_models(url, key)
-                if result is None:
-                    raise HTTPException(status_code=500, detail=ERROR_MESSAGES.SERVER_CONNECTION_ERROR)
-                if 'error' in result:
-                    raise HTTPException(status_code=500, detail=result['error'])
-                return result
+
+async def _verify_single_connection(request: Request, url: str, key: str, api_config: dict, user):
+    # Resolve the proxy exactly the way a real request does: this covers both the
+    # single `proxy` field and a rotating `proxies` list. Using only
+    # `api_config['proxy']` here silently verified over a DIRECT connection when a
+    # list was configured, which reported the upstream's IP ban instead of
+    # exercising the proxies the admin had set up.
+    try:
+        # Validate every entry up front so a bad URL is reported as a proxy
+        # problem before any request is made.
+        for candidate in api_config.get('proxies') or []:
+            if isinstance(candidate, str) and candidate.strip():
+                normalize_proxy(candidate)
+        if api_config.get('proxy'):
+            normalize_proxy(api_config.get('proxy'))
+    except ProxyConfigError as error:
+        return JSONResponse(
+            status_code=400,
+            content={'detail': f'Invalid proxy configuration: {error}', 'proxy': describe_proxy(api_config)},
+        )
+
+    proxy = connection_proxy(api_config, connection_key=f'verify:{url}')
+    session = await get_session(proxy)
+    try:
+        headers, cookies = await get_headers_and_cookies(request, url, key, api_config, user=user)
+
+        if api_config.get('azure') or api_config.get('provider') == 'azure':
+            # Only set api-key header if not using Azure Entra ID authentication
+            auth_type = api_config.get('auth_type', 'bearer')
+            if auth_type not in ('azure_ad', 'microsoft_entra_id'):
+                headers['api-key'] = key
+
+            # Azure v1 format: base URL already ends with /openai/v1,
+            # use standard /models endpoint without api-version.
+            is_azure_v1 = bool(re.search(r'/openai/v1(?:/|$)', url))
+
+            if is_azure_v1:
+                verify_url = f'{url.rstrip("/")}/models'
             else:
-                async with session.get(
-                    f'{url}/models',
-                    headers=headers,
-                    cookies=cookies,
-                    ssl=AIOHTTP_CLIENT_SESSION_SSL,
-                ) as r:
-                    try:
-                        response_data = await r.json(loads=JSONCodec.loads)
-                    except Exception:
-                        response_data = await r.text()
+                api_version = api_config.get('api_version', '') or '2023-03-15-preview'
+                verify_url = f'{url}/openai/models?api-version={api_version}'
 
-                    if r.status != 200:
-                        if isinstance(response_data, (dict, list)):
-                            return JSONResponse(status_code=r.status, content=response_data)
-                        else:
-                            return PlainTextResponse(status_code=r.status, content=response_data)
+            async with session.get(
+                url=verify_url,
+                headers=headers,
+                cookies=cookies,
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                **request_proxy_kwargs(proxy),
+            ) as r:
+                try:
+                    response_data = await r.json(loads=JSONCodec.loads)
+                except Exception:
+                    response_data = await r.text()
 
-                    return response_data
+                if r.status != 200:
+                    if isinstance(response_data, (dict, list)):
+                        return JSONResponse(status_code=r.status, content=response_data)
+                    else:
+                        return PlainTextResponse(status_code=r.status, content=response_data)
 
-        except aiohttp.ClientError as e:
-            # ClientError covers all aiohttp requests issues
-            log.exception(f'Client error: {str(e)}')
-            raise HTTPException(status_code=500, detail=ERROR_MESSAGES.SERVER_CONNECTION_ERROR)
-        except Exception as e:
-            log.exception(f'Unexpected error: {e}')
-            raise HTTPException(status_code=500, detail=ERROR_MESSAGES.SERVER_CONNECTION_ERROR)
+                return response_data
+        elif is_anthropic_url(url):
+            result = await get_anthropic_models(url, key)
+            if result is None:
+                raise HTTPException(status_code=500, detail=ERROR_MESSAGES.SERVER_CONNECTION_ERROR)
+            if 'error' in result:
+                raise HTTPException(status_code=500, detail=result['error'])
+            return result
+        else:
+            proxy = connection_proxy(api_config)
+            async with session.get(
+                f'{url}/models',
+                headers=headers,
+                cookies=cookies,
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                **request_proxy_kwargs(proxy),
+            ) as r:
+                try:
+                    response_data = await r.json(loads=JSONCodec.loads)
+                except Exception:
+                    response_data = await r.text()
+
+                if r.status != 200:
+                    if isinstance(response_data, (dict, list)):
+                        return JSONResponse(status_code=r.status, content=response_data)
+                    else:
+                        return PlainTextResponse(status_code=r.status, content=response_data)
+
+                return response_data
+
+    except aiohttp.ClientError as e:
+        # ClientError covers all aiohttp requests issues
+        log.exception(f'Client error: {str(e)}')
+        raise HTTPException(status_code=500, detail=ERROR_MESSAGES.SERVER_CONNECTION_ERROR)
+    except Exception as e:
+        log.exception(f'Unexpected error: {e}')
+        raise HTTPException(status_code=500, detail=ERROR_MESSAGES.SERVER_CONNECTION_ERROR)
 
 
 def get_azure_allowed_params(api_version: str) -> set[str]:
@@ -1574,8 +1733,9 @@ async def generate_chat_completion(
     streaming = False
     response = None
 
+    proxy = connection_proxy(api_config)
     try:
-        session = await get_session()
+        session = await get_session(proxy)
 
         r = await session.request(
             method='POST',
@@ -1584,6 +1744,7 @@ async def generate_chat_completion(
             headers=headers,
             cookies=cookies,
             ssl=AIOHTTP_CLIENT_SESSION_SSL,
+            **request_proxy_kwargs(proxy),
             timeout=get_client_timeout(stream=is_streaming_request),
         )
 
@@ -1730,8 +1891,9 @@ async def embeddings(request: Request, form_data: dict, user):
         embeddings_url = f'{url}/embeddings'
     requested_model = form_data.get('model')
 
+    proxy = connection_proxy(api_config)
     try:
-        session = await get_session()
+        session = await get_session(proxy)
         r = await session.request(
             method='POST',
             url=embeddings_url,
@@ -1740,6 +1902,7 @@ async def embeddings(request: Request, form_data: dict, user):
             cookies=cookies,
             timeout=get_client_timeout(),
             ssl=AIOHTTP_CLIENT_SESSION_SSL,
+            **request_proxy_kwargs(proxy),
         )
 
         if 'text/event-stream' in r.headers.get('Content-Type', ''):
@@ -1859,7 +2022,8 @@ async def responses(
         else:
             request_url = f'{url}/responses'
 
-        session = await get_session()
+        proxy = connection_proxy(api_config)
+        session = await get_session(proxy)
         r = await session.request(
             method='POST',
             url=request_url,
@@ -1867,6 +2031,7 @@ async def responses(
             headers=headers,
             cookies=cookies,
             ssl=AIOHTTP_CLIENT_SESSION_SSL,
+            **request_proxy_kwargs(proxy),
             timeout=get_client_timeout(stream=is_streaming_request),
         )
 
@@ -1982,7 +2147,8 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
         else:
             request_url = f'{url}/{path}'
 
-        session = await get_session()
+        proxy = connection_proxy(api_config)
+        session = await get_session(proxy)
         r = await session.request(
             method=request.method,
             url=request_url,
@@ -1990,6 +2156,7 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
             headers=headers,
             cookies=cookies,
             ssl=AIOHTTP_CLIENT_SESSION_SSL,
+            **request_proxy_kwargs(proxy),
             timeout=get_client_timeout(stream=is_streaming_request),
         )
 
